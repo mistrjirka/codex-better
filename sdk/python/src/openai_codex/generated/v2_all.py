@@ -2977,6 +2977,19 @@ class ModelProviderCapabilitiesReadResponse(BaseModel):
     web_search: Annotated[bool, Field(alias="webSearch")]
 
 
+class ModelProviderDefaultSetParams(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    provider_id: Annotated[
+        str,
+        Field(
+            alias="providerId",
+            description="Configured provider to use by default for new threads and unscoped model lists.",
+        ),
+    ]
+
+
 class ModelProviderMismatchModelProviderError(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -8171,6 +8184,17 @@ class ModelProviderListRequest(BaseModel):
     params: ModelProviderListParams
 
 
+class ModelProviderDefaultSetRequest(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: RequestId
+    method: Annotated[
+        Literal["modelProvider/default/set"], Field(title="ModelProvider/default/setRequestMethod")
+    ]
+    params: ModelProviderDefaultSetParams
+
+
 class ModelProviderCapabilitiesReadRequest(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -11133,6 +11157,13 @@ class ThreadListParams(BaseModel):
             description="Thread IDs to exclude before applying the result limit. Up to 100 entries; invalid IDs or a larger list are rejected, never truncated. Send the same exclusions on each page. Omitted, null, or empty means no exclusions.",
         ),
     ] = None
+    included_thread_ids: Annotated[
+        list[str] | None,
+        Field(
+            alias="includedThreadIds",
+            description="Restrict results to up to 100 thread IDs before pagination. Omit or send null for unrestricted results. An empty list matches nothing. Exclusions still apply. Repeat the same IDs on each page. The local store uses indexed metadata for this filter.",
+        ),
+    ] = None
     limit: Annotated[
         int | None,
         Field(description="Optional page size; defaults to a reasonable server-side value.", ge=0),
@@ -11186,7 +11217,7 @@ class ThreadListParams(BaseModel):
         bool | None,
         Field(
             alias="useStateDbOnly",
-            description="If true, return from the state DB without scanning JSONL rollouts to repair thread metadata. Omitted or false preserves scan-and-repair behavior.",
+            description="If true, the local store returns indexed metadata without scanning JSONL rollouts for repairs. Requests with `includedThreadIds` always use indexed metadata.",
         ),
     ] = None
 
@@ -13922,6 +13953,7 @@ class ClientRequest(
         | AccountGatewayOAuthCancelRequest
         | ModelProviderListRequest
         | ModelProviderConfigWriteRequest
+        | ModelProviderDefaultSetRequest
         | ModelProviderCapabilitiesReadRequest
         | ExperimentalFeatureListRequest
         | PermissionProfileListRequest
@@ -14034,6 +14066,7 @@ class ClientRequest(
         | AccountGatewayOAuthCancelRequest
         | ModelProviderListRequest
         | ModelProviderConfigWriteRequest
+        | ModelProviderDefaultSetRequest
         | ModelProviderCapabilitiesReadRequest
         | ExperimentalFeatureListRequest
         | PermissionProfileListRequest
