@@ -108,6 +108,8 @@ async fn spawn_reports_effective_settings_after_child_runtime_is_removed() -> Re
                 AgentRoleConfig {
                     description: Some("Custom role".to_string()),
                     config_file: Some(role_path.to_path_buf()),
+                    model_provider: None,
+                    model_catalog_json: None,
                     nickname_candidates: Some(vec!["Captured".to_string()]),
                 },
             );

@@ -190,6 +190,15 @@ impl AgentControl for TestAgentControl {
         Box::pin(async { Err(CodexErr::InvalidRequest("host spawn rejection".to_string())) })
     }
 
+    fn child_uses_openai_provider(
+        &self,
+        _agent: ThreadId,
+        _parent_config: codex_core::config::Config,
+    ) -> BoxFuture<'_, CodexResult<bool>> {
+        // All agents in this synthetic control fixture use the first-party provider.
+        Box::pin(async { Ok(true) })
+    }
+
     fn send(&self, request: SendRequest) -> BoxFuture<'_, CodexResult<DeliveryReceipt>> {
         assert_eq!(request.caller, self.thread_id);
         Box::pin(async { Err(CodexErr::InvalidRequest("host send rejection".to_string())) })

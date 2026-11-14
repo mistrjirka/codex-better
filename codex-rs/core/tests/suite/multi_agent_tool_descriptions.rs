@@ -162,6 +162,8 @@ async fn multi_agent_catalog_messages_change_only_selected_tool_fields(
                     AgentRoleConfig {
                         description: Some("Research the assigned question.".to_string()),
                         config_file: None,
+                        model_provider: None,
+                        model_catalog_json: None,
                         nickname_candidates: None,
                     },
                 );

@@ -13,6 +13,7 @@ use crate::memory_usage::emit_metric_for_tool_read;
 use crate::memory_usage::shell_script_for_invocation;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
+use crate::tools::context::DirectToolCallSourcePolicy;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolCallState;
 use crate::tools::context::ToolEnvironments;
@@ -65,6 +66,10 @@ pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
     /// The handler observes its cancellation token and must finish before dispatch is aborted.
     fn finishes_on_cancellation(&self) -> bool {
         false
+    }
+
+    fn direct_tool_call_source_policy(&self) -> DirectToolCallSourcePolicy {
+        DirectToolCallSourcePolicy::Direct
     }
 
     /// Whether this built-in control tool needs a structured tool-call event.

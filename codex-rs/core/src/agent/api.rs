@@ -68,6 +68,14 @@ pub trait AgentControl: Send + Sync {
     /// the root. Legacy user input can address loaded threads outside the agent registry.
     fn send(&self, request: SendRequest) -> BoxFuture<'_, Result<DeliveryReceipt>>;
 
+    /// Verify the effective provider for an existing child, including persisted children.
+    /// Callers must fail closed if the provider cannot be resolved.
+    fn child_uses_openai_provider(
+        &self,
+        agent: ThreadId,
+        parent_config: Config,
+    ) -> BoxFuture<'_, Result<bool>>;
+
     /// Take queued, non-turn-starting mail in order, without loading the recipient.
     /// This in-memory operation performs no I/O; returning transfers ownership to the caller.
     fn take_mailbox(&self, agent: ThreadId) -> Vec<crate::PendingAgentMessage>;

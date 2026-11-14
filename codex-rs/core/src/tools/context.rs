@@ -65,6 +65,29 @@ pub enum ToolCallSource {
     },
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum DirectToolCallSourcePolicy {
+    #[default]
+    Direct,
+    EncryptedWithPlaintextFallback,
+    Plaintext,
+}
+
+impl DirectToolCallSourcePolicy {
+    pub(crate) fn classify(self, encrypted_function_args: Option<&[String]>) -> ToolCallSource {
+        match self {
+            Self::Direct => ToolCallSource::Direct,
+            Self::EncryptedWithPlaintextFallback
+                if encrypted_function_args.is_some_and(<[String]>::is_empty) =>
+            {
+                ToolCallSource::DirectPlaintextMessage
+            }
+            Self::EncryptedWithPlaintextFallback => ToolCallSource::Direct,
+            Self::Plaintext => ToolCallSource::DirectPlaintextMessage,
+        }
+    }
+}
+
 /// Targets captured from the original call. Environments follow the order declared by the tool.
 #[derive(Clone, Default)]
 pub(crate) enum ToolEnvironments {

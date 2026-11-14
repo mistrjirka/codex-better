@@ -19,6 +19,7 @@ use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::codex_thread::GuardianRootSnapshot;
 use crate::codex_thread::ThreadConfigSnapshot;
+use crate::config::Config;
 use crate::rollout_budget::RolloutBudgetReminder;
 use codex_protocol::AgentPath;
 use codex_protocol::SessionId;
@@ -94,6 +95,17 @@ impl AgentControl for LocalAgentControl {
                 }
             };
             Box::pin(self.spawn_agent_internal(config, input, Some(source), options)).await
+        })
+    }
+
+    fn child_uses_openai_provider(
+        &self,
+        agent: ThreadId,
+        parent_config: Config,
+    ) -> BoxFuture<'_, Result<bool>> {
+        Box::pin(async move {
+            self.agent_uses_openai_model_provider(agent, &parent_config)
+                .await
         })
     }
 

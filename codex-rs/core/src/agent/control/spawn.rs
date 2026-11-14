@@ -1,3 +1,4 @@
+use super::model_provider::*;
 use super::residency::is_v2_resident_session_source;
 use super::spawn_guard::PendingSpawn;
 use super::spawn_guard::SpawnOwner;
@@ -9,6 +10,7 @@ use crate::agent::helper_daybreak;
 use crate::agent::history::load_agent_model_context;
 use crate::agent::history::prepare_forked_history;
 use crate::agent::role::apply_role_to_config;
+use crate::agent::role::apply_role_to_config_for_resume;
 use crate::agent::types::AgentMetadata;
 use crate::agent::types::LiveAgent;
 use crate::agent::types::SpawnAgentOptions;
@@ -23,6 +25,7 @@ use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::error::AgentErrorContext;
 use codex_protocol::intersect_effective_permission_profiles;
 use codex_protocol::protocol::EnvironmentConfigState;
+use codex_thread_store::StoredThread;
 use codex_utils_path_uri::PathUri;
 use futures::StreamExt;
 use futures::stream;
@@ -361,6 +364,16 @@ impl LocalAgentControl {
             None
         };
         config.model_reasoning_effort = stored_reasoning_effort;
+        let parent_thread_id = owner_thread_id
+            .or_else(|| session_source.parent_thread_id())
+            .or(stored_parent_thread_id);
+        let model_provider_baseline =
+            model_provider_baseline_for_parent(&state, &config, parent_thread_id).await?;
+        restore_persisted_agent_model_provider(
+            &mut config,
+            &model_provider_baseline,
+            &stored_model_provider,
+        )?;
         if let Some(role_name) = session_source.get_agent_role() {
             let runtime_approval_policy = config.permissions.approval_policy.value();
             let runtime_approvals_reviewer = config.approvals_reviewer;
@@ -378,7 +391,7 @@ impl LocalAgentControl {
                 ),
             };
 
-            apply_role_to_config(&mut config, Some(&role_name))
+            apply_role_to_config_for_resume(&mut config, Some(&role_name))
                 .await
                 .map_err(CodexErr::InvalidRequest)?;
             config
@@ -775,7 +788,15 @@ impl LocalAgentControl {
             disabled_plugin_ids,
             ..StartThreadOptions::new(config.clone())
         };
-        let mut cyber_access_program = options.cyber_access_program;
+        // Preserve Daybreak for eligible first-party children only. Non-OpenAI
+        // providers cannot accept Cyber access-program selections or saved helper intent.
+        let child_supports_cyber = config
+            .model_provider
+            .supports_cyber_access_programs(&config.model_provider_id)
+            && codex_model_provider::provider_uses_first_party_auth_path(&config.model_provider);
+        let mut cyber_access_program = options
+            .cyber_access_program
+            .filter(|_| child_supports_cyber);
         let mut inherited_program_to_resolve = None;
         if let Some(parent_id) = session_source
             .as_ref()
@@ -787,7 +808,8 @@ impl LocalAgentControl {
                 None => None,
             };
             let spawn_owner = helper_daybreak::eligible_owner(&parent.session);
-            if options.cyber_access_program_source == SpawnProgramSource::ParentTurn
+            if child_supports_cyber
+                && options.cyber_access_program_source == SpawnProgramSource::ParentTurn
                 && let Some(resolution) = turn.as_ref().and_then(|turn| {
                     turn.extension_data
                         .get::<helper_daybreak::turn::SavedProgramResolution>()
@@ -799,7 +821,8 @@ impl LocalAgentControl {
                 // Carry the saved choice. The child resolves it for its own model and account.
                 cyber_access_program = None;
             }
-            if config.features.enabled(Feature::DaybreakProgramPropagation)
+            if child_supports_cyber
+                && config.features.enabled(Feature::DaybreakProgramPropagation)
                 && let Some(enrollment) = parent
                     .thread_extension_data()
                     .get::<helper_daybreak::Enrollment>()
@@ -1145,7 +1168,7 @@ impl LocalAgentControl {
 
     async fn resume_single_agent_from_rollout(
         &self,
-        config: Config,
+        mut config: Config,
         thread_id: ThreadId,
         session_source: SessionSource,
     ) -> CodexResult<(ThreadId, MultiAgentVersion)> {
@@ -1165,6 +1188,9 @@ impl LocalAgentControl {
             .map_err(|err| CodexErr::InvalidRequest(format!("invalid stored agent path: {err}")))?;
         let resumed_agent_nickname = stored_thread.agent_nickname.clone();
         let resumed_agent_role = stored_thread.agent_role.clone();
+        let parent_thread_id = stored_thread
+            .parent_thread_id
+            .or_else(|| session_source.parent_thread_id());
         let history =
             load_agent_model_context(&state, thread_id, stored_thread.history_mode).await?;
         let initial_history = InitialHistory::Resumed(ResumedHistory {
@@ -1173,7 +1199,6 @@ impl LocalAgentControl {
             history: Arc::new(history.items),
             rollout_path: stored_thread.rollout_path,
         });
-        let parent_thread_id = stored_thread.parent_thread_id;
         let multi_agent_version = state
             .effective_multi_agent_version_for_spawn(
                 &initial_history,

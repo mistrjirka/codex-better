@@ -43,17 +43,12 @@ use crate::tools::handlers::multi_agents_common::MIN_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
-use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
-use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
-use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
-use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHandlerV2;
-use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHandlerV2;
-use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandlerV2;
+use crate::tools::handlers::multi_agents_v2::MultiAgentV2ToolOptions;
+use crate::tools::handlers::multi_agents_v2::register_multi_agent_v2_tools;
 use crate::tools::handlers::tool_search_spec::ToolSearchSourceListing;
 use crate::tools::handlers::view_image_spec::ViewImageToolOptions;
 use crate::tools::hosted_spec::WebSearchToolOptions;
 use crate::tools::hosted_spec::create_web_search_tool;
-use crate::tools::multi_agent_tool::multi_agent_v2_handler;
 use crate::tools::registry::NativeReview;
 use crate::tools::registry::RegisteredTool;
 use crate::tools::registry::ToolExposure;
@@ -1509,14 +1504,11 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
     if collab_tools_enabled(turn_context, context.model_info) {
         if multi_agent_v2_enabled(turn_context) {
             let model_messages = ResolvedModelMessages::from_model(context.model_info);
-            let spawn_agent_description =
-                model_messages.multi_agent_tool_description_override("spawn_agent");
             let exposure = if turn_context.config.multi_agent_v2.non_code_mode_only {
                 ToolExposure::DirectModelOnly
             } else {
                 ToolExposure::Direct
             };
-            let tool_namespace = turn_context.config.multi_agent_v2.tool_namespace.as_deref();
             let native_review = if turn_context
                 .config
                 .guardian_native_multi_agent_history_enabled()
@@ -1527,93 +1519,47 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
             };
             let agent_type_description =
                 agent_type_description(turn_context, context.default_agent_type_description);
-            let hide_spawn_agent_metadata =
-                turn_context.config.multi_agent_v2.hide_spawn_agent_metadata;
-            registry.register_trusted_with_native_review(
-                multi_agent_v2_handler(
-                    SpawnAgentHandlerV2::new(
-                        SpawnAgentToolOptions {
-                            available_models: turn_context.available_models.clone(),
-                            multi_agent_version: turn_context.multi_agent_version,
-                            model_catalog_in_context: turn_context
-                                .config
-                                .features
-                                .enabled(Feature::ModelCatalogInContext),
-                            agent_type_description,
-                            expose_agent_type: !turn_context.config.agent_roles.is_empty(),
-                            hide_agent_type_model_reasoning: hide_spawn_agent_metadata,
-                            expose_spawn_agent_model_overrides: turn_context
-                                .config
-                                .multi_agent_v2
-                                .expose_spawn_agent_model_overrides,
-                            usage_hint_text: turn_context
-                                .config
-                                .multi_agent_v2
-                                .usage_hint_text
-                                .clone(),
-                        },
-                        spawn_agent_description.map(str::to_owned),
-                    ),
-                    tool_namespace,
-                    // Spawn composes the selected description with inheritance and usage guidance.
-                    /*description_override*/
-                    None,
-                    model_messages.multi_agent_tool_parameters_override("spawn_agent"),
-                ),
-                exposure,
-                native_review,
-            );
-            if !turn_context.config.multi_agent_v2.disable_direct_message {
-                registry.register_trusted_with_native_review(
-                    multi_agent_v2_handler(
-                        SendMessageHandlerV2,
-                        tool_namespace,
-                        model_messages.multi_agent_tool_description_override("send_message"),
-                        model_messages.multi_agent_tool_parameters_override("send_message"),
-                    ),
+            let provider_is_openai = turn_context.config.model_provider.is_openai();
+            let external_bridge_enabled =
+                provider_is_openai && turn_context.config.has_authorized_external_subagent_role();
+            register_multi_agent_v2_tools(
+                registry,
+                MultiAgentV2ToolOptions {
+                    namespace: turn_context.config.multi_agent_v2.tool_namespace.as_deref(),
                     exposure,
+                    provider_is_openai,
+                    external_bridge_enabled,
+                    disable_direct_message: turn_context
+                        .config
+                        .multi_agent_v2
+                        .disable_direct_message,
                     native_review,
-                );
-                registry.register_trusted_with_native_review(
-                    multi_agent_v2_handler(
-                        FollowupTaskHandlerV2,
-                        tool_namespace,
-                        model_messages.multi_agent_tool_description_override("followup_task"),
-                        model_messages.multi_agent_tool_parameters_override("followup_task"),
-                    ),
-                    exposure,
-                    native_review,
-                );
-            }
-            if turn_context.config.multi_agent_v2.wait_agent_enabled {
-                registry.register_trusted_with_exposure(
-                    multi_agent_v2_handler(
-                        WaitAgentHandlerV2::new(context.wait_agent_timeouts),
-                        tool_namespace,
-                        model_messages.multi_agent_tool_description_override("wait_agent"),
-                        model_messages.multi_agent_tool_parameters_override("wait_agent"),
-                    ),
-                    exposure,
-                );
-            }
-            registry.register_trusted_with_native_review(
-                multi_agent_v2_handler(
-                    InterruptAgentHandler,
-                    tool_namespace,
-                    model_messages.multi_agent_tool_description_override("interrupt_agent"),
-                    model_messages.multi_agent_tool_parameters_override("interrupt_agent"),
-                ),
-                exposure,
-                native_review,
-            );
-            registry.register_trusted_with_exposure(
-                multi_agent_v2_handler(
-                    ListAgentsHandlerV2,
-                    tool_namespace,
-                    model_messages.multi_agent_tool_description_override("list_agents"),
-                    model_messages.multi_agent_tool_parameters_override("list_agents"),
-                ),
-                exposure,
+                    model_messages: &model_messages,
+                    spawn: SpawnAgentToolOptions {
+                        available_models: turn_context.available_models.clone(),
+                        multi_agent_version: turn_context.multi_agent_version,
+                        model_catalog_in_context: turn_context
+                            .config
+                            .features
+                            .enabled(Feature::ModelCatalogInContext),
+                        agent_type_description,
+                        expose_agent_type: !turn_context.config.agent_roles.is_empty(),
+                        hide_agent_type_model_reasoning: turn_context
+                            .config
+                            .multi_agent_v2
+                            .hide_spawn_agent_metadata,
+                        expose_spawn_agent_model_overrides: turn_context
+                            .config
+                            .multi_agent_v2
+                            .expose_spawn_agent_model_overrides,
+                        usage_hint_text: turn_context.config.multi_agent_v2.usage_hint_text.clone(),
+                    },
+                    wait_agent: turn_context
+                        .config
+                        .multi_agent_v2
+                        .wait_agent_enabled
+                        .then_some(context.wait_agent_timeouts),
+                },
             );
         } else {
             let agent_type_description =

@@ -36,6 +36,7 @@ use crate::thread_manager::ForkSnapshot;
 use crate::thread_manager::StartThreadOptions;
 use crate::tools::handlers::multi_agents_common::thread_spawn_source;
 use assert_matches::assert_matches;
+use codex_config::CONFIG_TOML_FILE;
 use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::Instructions;
 use codex_extension_api::LoadInstructionsFuture;
@@ -1269,6 +1270,8 @@ async fn cancelled_v2_send_finishes_reload_registration() {
 enum V2ReloadRoute {
     Sender,
     NestedParent,
+    RevokedChildProvider,
+    RevokedParentProvider,
 }
 
 async fn spawn_v2_reload_test_child(
@@ -1297,6 +1300,15 @@ async fn spawn_v2_reload_test_child(
         )
         .await
         .expect("spawn_agent should succeed")
+}
+
+fn select_test_provider(config: &mut Config, provider_id: &str) {
+    config.model_provider_id = provider_id.to_string();
+    config.model_provider = config
+        .model_providers
+        .get(provider_id)
+        .cloned()
+        .expect("test provider should be configured");
 }
 
 async fn check_v2_agent_reload(route: V2ReloadRoute) {
@@ -1340,21 +1352,20 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
         .local_agent_runtime
         .control(root.thread.session.session_id());
     let parent_thread = match route {
-        V2ReloadRoute::Sender => root.thread,
-        V2ReloadRoute::NestedParent => {
-            let parent = spawn_v2_reload_test_child(
-                &control,
-                harness.config.clone(),
-                &root.thread,
-                "parent",
-            )
-            .await;
+        V2ReloadRoute::NestedParent | V2ReloadRoute::RevokedParentProvider => {
+            let mut parent_config = harness.config.clone();
+            if matches!(route, V2ReloadRoute::RevokedParentProvider) {
+                select_test_provider(&mut parent_config, "ollama");
+            }
+            let parent =
+                spawn_v2_reload_test_child(&control, parent_config, &root.thread, "parent").await;
             harness
                 .manager
                 .get_thread(parent.thread_id)
                 .await
                 .expect("nested parent should exist")
         }
+        V2ReloadRoute::Sender | V2ReloadRoute::RevokedChildProvider => root.thread,
     };
     let parent_thread_id = parent_thread.session.thread_id;
     let inherited_instructions = parent_thread.session.inherited_instructions().await;
@@ -1362,6 +1373,13 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
     assert!(inherited_instructions.thread.is_some());
     let mut child_config = harness.config.clone();
     child_config.model = Some("gpt-5.6-luna".to_string());
+    if matches!(
+        route,
+        V2ReloadRoute::Sender | V2ReloadRoute::RevokedChildProvider
+    ) {
+        select_test_provider(&mut child_config, "ollama");
+    }
+    let child_model_provider = child_config.model_provider.clone();
     let spawned_agent =
         spawn_v2_reload_test_child(&control, child_config, &parent_thread, "worker").await;
     let agent_path = spawned_agent
@@ -1392,7 +1410,6 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
         .await
         .expect("child metadata should be readable");
     assert_eq!(stored_child.history_mode, ThreadHistoryMode::Paginated);
-
     assert!(
         harness
             .manager
@@ -1417,12 +1434,17 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
     }
 
     let mut sender_config = harness.config.clone();
-    sender_config.model_provider_id = "ollama".to_string();
-    sender_config.model_provider = sender_config
-        .model_providers
-        .get("ollama")
-        .cloned()
-        .expect("ollama provider should be configured");
+    if matches!(route, V2ReloadRoute::Sender) {
+        let user_config = toml::from_str("subagent_model_provider_allowlist = [\"ollama\"]")
+            .expect("valid user config");
+        sender_config.config_layer_stack = sender_config
+            .config_layer_stack
+            .with_user_config(
+                &sender_config.codex_home.join(CONFIG_TOML_FILE),
+                user_config,
+            )
+            .expect("provider allowlist should be valid user config");
+    }
 
     let mut parent_turn = parent_thread.session.new_default_turn().await;
     let residency_pin = match route {
@@ -1524,10 +1546,7 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
                 .info()
                 .clone(),
         ),
-        (
-            stored_child.model_provider,
-            harness.config.model_provider.clone()
-        ),
+        (stored_child.model_provider, child_model_provider),
         "residency reload must preserve the worker provider instead of inheriting its sender's provider",
     );
 
@@ -4942,6 +4961,8 @@ async fn spawn_thread_subagent_uses_role_specific_nickname_candidates() {
         AgentRoleConfig {
             description: Some("Research role".to_string()),
             config_file: None,
+            model_provider: None,
+            model_catalog_json: None,
             nickname_candidates: Some(vec!["Atlas".to_string()]),
         },
     );
@@ -6000,7 +6021,14 @@ async fn resume_agent_from_rollout_reopens_open_descendants_after_manager_shutdo
 
 #[tokio::test]
 async fn resume_agent_from_rollout_uses_edge_data_when_descendant_metadata_source_is_stale() {
-    let harness = AgentControlHarness::new().await;
+    let (home, mut config) = test_config().await;
+    let user_config = toml::from_str("subagent_model_provider_allowlist = [\"ollama\"]")
+        .expect("valid user config");
+    config.config_layer_stack = config
+        .config_layer_stack
+        .with_user_config(&config.codex_home.join(CONFIG_TOML_FILE), user_config)
+        .expect("provider allowlist should be valid user config");
+    let harness = AgentControlHarness::new_with_config(home, config).await;
     let (parent_thread_id, parent_thread) = harness.start_thread().await;
 
     let child_thread_id = harness
@@ -6018,10 +6046,12 @@ async fn resume_agent_from_rollout_uses_edge_data_when_descendant_metadata_sourc
         )
         .await
         .expect("child spawn should succeed");
+    let mut grandchild_config = harness.config.clone();
+    select_test_provider(&mut grandchild_config, "ollama");
     let grandchild_thread_id = harness
         .control
         .spawn_agent(
-            harness.config.clone(),
+            grandchild_config,
             text_input("hello grandchild"),
             Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id: child_thread_id,
@@ -6047,6 +6077,9 @@ async fn resume_agent_from_rollout_uses_edge_data_when_descendant_metadata_sourc
     persist_thread_for_tree_resume(&parent_thread, "parent persisted").await;
     persist_thread_for_tree_resume(&child_thread, "child persisted").await;
     persist_thread_for_tree_resume(&grandchild_thread, "grandchild persisted").await;
+    let grandchild_rollout_path = grandchild_thread
+        .rollout_path()
+        .expect("grandchild rollout should exist");
     wait_for_live_thread_spawn_children(&harness.control, parent_thread_id, &[child_thread_id])
         .await;
     wait_for_live_thread_spawn_children(&harness.control, child_thread_id, &[grandchild_thread_id])
@@ -6080,6 +6113,8 @@ async fn resume_agent_from_rollout_uses_edge_data_when_descendant_metadata_sourc
         .await;
     assert_eq!(report.submit_failed, Vec::<ThreadId>::new());
     assert_eq!(report.timed_out, Vec::<ThreadId>::new());
+
+    clear_rollout_session_parent(&grandchild_rollout_path);
 
     let resumed_parent_thread_id = harness
         .control
@@ -6121,6 +6156,7 @@ async fn resume_agent_from_rollout_uses_edge_data_when_descendant_metadata_sourc
     };
     assert_eq!(resumed_parent_thread_id, child_thread_id);
     assert_eq!(resumed_depth, 2);
+    assert_eq!(resumed_grandchild_snapshot.model_provider_id, "ollama");
 
     let _ = harness
         .control

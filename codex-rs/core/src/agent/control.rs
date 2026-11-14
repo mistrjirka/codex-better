@@ -75,6 +75,7 @@ mod inspection;
 mod interrupt;
 mod legacy;
 mod mailbox;
+mod model_provider;
 mod residency;
 pub use residency::ThreadEvictionOutcome;
 mod resume;

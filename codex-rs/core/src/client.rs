@@ -126,6 +126,8 @@ use crate::attestation::X_OAI_ATTESTATION_HEADER;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
+use crate::client_common::normalize_input_for_non_openai_provider;
+use crate::client_common::tool_specs_for_muse_spark;
 use crate::context::BaseInstructionsFragment;
 use crate::context::ContextualUserFragment;
 use crate::cyber_access_program;
@@ -1195,9 +1197,12 @@ impl ModelClient {
             self.state.thread_id.to_string().as_bytes(),
         );
         let mut prefix = Vec::new();
+        let compatible_tools = (!is_openai && model_info.slug.starts_with("muse-spark"))
+            .then(|| tool_specs_for_muse_spark(&prompt.tools));
+        let model_tools = compatible_tools.as_deref().unwrap_or(prompt.tools.as_ref());
         let tools = if model_info.use_responses_lite {
-            if !prompt.tools.is_empty() {
-                let tools = create_tools_json_for_responses_lite(&prompt.tools)?;
+            if !model_tools.is_empty() {
+                let tools = create_tools_json_for_responses_lite(model_tools)?;
                 prefix.push(ResponseItem::AdditionalTools {
                     id: Some(ResponseItemId::with_suffix(
                         "at",
@@ -1209,7 +1214,7 @@ impl ModelClient {
             }
             None
         } else {
-            Some(create_tools_raw_json_for_responses_api(&prompt.tools)?.into())
+            Some(create_tools_raw_json_for_responses_api(model_tools)?.into())
         };
         if !prompt.base_instructions.text.is_empty() {
             let mut instructions = ContextualUserFragment::into(BaseInstructionsFragment(
@@ -1229,6 +1234,9 @@ impl ModelClient {
             }
         }
         if !is_openai {
+            // A non-OpenAI provider must never receive OpenAI-only controls or
+            // encrypted inter-agent messages. Reject rather than silently leak.
+            input = normalize_input_for_non_openai_provider(input)?;
             for item in &mut input {
                 item.clear_internal_chat_message_metadata_passthrough();
                 if !matches!(

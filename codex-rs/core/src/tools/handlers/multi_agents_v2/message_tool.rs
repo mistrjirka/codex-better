@@ -12,6 +12,7 @@ use crate::agent::api::SendRequest;
 use crate::agent::child_config::build_agent_resume_config;
 use crate::agent::types::MessageDeliveryMode;
 use crate::tools::context::FunctionToolOutput;
+use crate::tools::handlers::multi_agent_message::AgentMessageRoute;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -29,24 +30,15 @@ pub(crate) struct FollowupTaskArgs {
     pub(crate) message: String,
 }
 
-pub(super) fn message_content(message: String) -> Result<String, FunctionCallError> {
-    if message.trim().is_empty() {
-        return Err(FunctionCallError::RespondToModel(
-            "Empty message can't be sent to an agent".to_string(),
-        ));
-    }
-    Ok(message)
-}
-
 /// Handles the shared MultiAgentV2 message flow for both `send_message` and `followup_task`.
 pub(super) async fn handle_message_string_tool(
     invocation: ToolInvocation,
     mode: MessageDeliveryMode,
+    message_route: AgentMessageRoute,
     target: String,
     message: String,
     analytics: &mut ToolCallAnalytics,
 ) -> Result<FunctionToolOutput, FunctionCallError> {
-    let message = message_content(message)?;
     let ToolInvocation {
         session,
         turn,
@@ -54,10 +46,22 @@ pub(super) async fn handle_message_string_tool(
         source,
         ..
     } = invocation;
+    message_route.validate_message(&message)?;
     let receiver_thread_id = resolve_agent_target(&session, &turn, &target).await?;
     analytics.set_receiver(receiver_thread_id);
     let resume_config =
         build_agent_resume_config(&turn).map_err(FunctionCallError::RespondToModel)?;
+    let recipient_is_openai = session
+        .services
+        .agent_control
+        .child_uses_openai_provider(receiver_thread_id, resume_config.clone())
+        .await
+        .map_err(|_| {
+            FunctionCallError::RespondToModel(
+                "Cannot verify the target agent's model provider".to_string(),
+            )
+        })?;
+    message_route.validate_recipient_provider(recipient_is_openai)?;
     let receipt = session
         .services
         .agent_control

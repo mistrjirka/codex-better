@@ -310,9 +310,15 @@ pub fn unauthenticated_auth_provider() -> SharedAuthProvider {
     Arc::new(UnauthenticatedAuthProvider)
 }
 
-/// Returns the provider-scoped auth manager when this provider uses command-backed auth.
-///
-/// Providers without custom auth continue using the caller-supplied base manager, when present.
+pub(crate) fn provider_uses_first_party_auth_path(provider: &ModelProviderInfo) -> bool {
+    provider.requires_openai_auth
+        && provider.env_key.is_none()
+        && provider.experimental_bearer_token.is_none()
+        && provider.auth.is_none()
+        && provider.aws.is_none()
+}
+
+/// Returns only the auth manager that is valid for this provider's auth path.
 pub(crate) fn auth_manager_for_provider(
     auth_manager: Option<Arc<AuthManager>>,
     provider: &ModelProviderInfo,

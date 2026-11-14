@@ -385,6 +385,7 @@ pub(crate) async fn handle_output_item_done(
 
             let cancellation_token = ctx.cancellation_token.child_token();
             let runtime = ctx.tool_runtime.clone();
+            let source = runtime.direct_source(&call);
             // handle_tool_call dispatches immediately, not when its future is polled.
             // Defer for post-model hooks or to cancel buffered calls during mailbox drains.
             let tool_future: InFlightFuture<'static> = if ctx.defer_tool_dispatch {
@@ -395,10 +396,16 @@ pub(crate) async fn handle_output_item_done(
                             ToolCallRuntime::aborted_response(&call, /*elapsed_secs*/ None);
                         return Ok(output.into_response());
                     }
-                    runtime.handle_tool_call(call, cancellation_token).await
+                    runtime
+                        .handle_direct_tool_call_with_source(call, source, cancellation_token)
+                        .await
                 })
             } else {
-                Box::pin(runtime.handle_tool_call(call, cancellation_token))
+                Box::pin(runtime.handle_direct_tool_call_with_source(
+                    call,
+                    source,
+                    cancellation_token,
+                ))
             };
 
             output.needs_follow_up = true;
