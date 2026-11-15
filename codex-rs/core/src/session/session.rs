@@ -285,6 +285,7 @@ impl SessionConfiguration {
             .map(|config| config.permission_profile.clone())
             .unwrap_or_else(|| self.permission_profile_state.snapshot());
         ThreadConfigSnapshot {
+            request_country: self.step_settings.request_country.clone(),
             model: self.step_settings.collaboration_mode.model().to_string(),
             model_provider_id: self.original_config_do_not_use.model_provider_id.clone(),
             service_tier: self.step_settings.service_tier.clone(),
@@ -694,6 +695,7 @@ impl Session {
             request_kind,
         );
         ExecutionMetadata::from_settings(&step_context.settings).apply_to(&mut responses_metadata);
+        responses_metadata.request_country = step_context.settings.request_country().clone();
         responses_metadata.guardian_recorded_items = self.parent_observer_event_tx.get().is_some();
         if responses_metadata.subagent_header.as_deref()
             == Some(crate::guardian::GUARDIAN_REVIEWER_NAME)
@@ -730,11 +732,11 @@ impl Session {
     // request remains turn-backed; local compaction does not have a finalized request inventory.
     pub(crate) async fn compaction_responses_metadata(
         &self,
-        turn_context: &TurnContext,
+        step_context: &StepContext,
         compaction_metadata: CompactionTurnMetadata,
     ) -> CodexResponsesMetadata {
         self.compaction_responses_metadata_for_window(
-            turn_context,
+            step_context,
             compaction_metadata,
             self.current_window().await,
         )
@@ -742,15 +744,17 @@ impl Session {
 
     pub(crate) fn compaction_responses_metadata_for_window(
         &self,
-        turn_context: &TurnContext,
+        step_context: &StepContext,
         compaction_metadata: CompactionTurnMetadata,
         (window_id, window_number, context_window_id): (String, u64, ContextWindowId),
     ) -> CodexResponsesMetadata {
-        let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
+        let turn_context = &step_context.turn;
+        let mut responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
             self.installation_id.clone(),
             window_id,
             CodexResponsesRequestKind::Compaction(compaction_metadata),
         );
+        responses_metadata.request_country = step_context.settings.request_country().clone();
         self.with_window_and_fork_metadata(
             turn_context,
             responses_metadata,
@@ -1283,7 +1287,8 @@ impl Session {
                 error!("failed to initialize thread persistence: {e:#}");
                 e
             })?;
-        let session_result: anyhow::Result<Arc<Self>> = async {
+        // Keep the large initialization future out of callers' stack frames.
+        let session_result: anyhow::Result<Arc<Self>> = Box::pin(async {
             if let InitialHistory::Resumed(resumed) = &mut initial_history
                 && let Some(history) = resume_context
             {
@@ -1802,6 +1807,24 @@ impl Session {
                     // This placeholder is used only for teardown, before the session is published.
                     Err(err) => (AgentRuntimeServices::Controller, Some(err)),
                 };
+            let mut local_agent_runtime = local_agent_runtime;
+            let mut account = crate::rollout_budget::ThreadBudgetAccount::Shared(Arc::clone(
+                &local_agent_runtime.rollout_budget,
+            ));
+            if startup_error.is_none() && matches!(&agent_runtime, AgentRuntimeServices::Controller) {
+                if let Some(native) = agent_control.native_rollout_budget() {
+                    local_agent_runtime.rollout_budget = Arc::clone(&native);
+                    account = crate::rollout_budget::ThreadBudgetAccount::Native(native);
+                }
+            }
+            let budget_policy = crate::rollout_budget::ThreadBudgetPolicy::new(
+                account,
+            )
+            .unwrap_or_else(|err| {
+                startup_error = Some(err);
+                // Teardown needs a session. Its empty policy is never published.
+                Default::default()
+            });
             state.shared_service_tier_pending = parent_thread_id.is_none()
                 && match &agent_runtime {
                     AgentRuntimeServices::Controller => has_provided_agent_control,
@@ -1849,6 +1872,7 @@ impl Session {
                 workspace_routing.as_ref().clone(),
                 extensions.model_request_contributors().to_vec(),
             )
+            .with_budget_policy(budget_policy.clone())
             .with_executed_tool_calls(executed_tool_calls.clone())
             .with_restored_history(matches!(
                 &initial_history,
@@ -1941,6 +1965,7 @@ impl Session {
                 mcp_thread_init,
                 client_mcp_extensions,
                 local_agent_runtime,
+                budget_policy,
                 agent_control,
                 network_proxy: arc_swap::ArcSwapOption::from(network_proxy.map(Arc::new)),
                 network_proxy_audit_metadata,
@@ -1994,7 +2019,7 @@ impl Session {
                 realtime_history: (session_configuration.history_mode
                     == ThreadHistoryMode::Paginated
                     && services.live_thread.is_some())
-                .then(|| Mutex::new(Default::default())),
+                .then(|| Mutex::new(crate::realtime_history::RealtimeHistoryState::default())),
                 active_turn: Mutex::new(None),
                 async_hook_results,
                 input_queue: InputQueue::with_controller(
@@ -2143,7 +2168,7 @@ impl Session {
                 state.queue_pending_session_start_source(session_start_source);
             }
             Ok(sess)
-        }
+        })
         .await;
         match session_result {
             Ok(sess) => {

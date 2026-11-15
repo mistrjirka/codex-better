@@ -511,6 +511,7 @@ pub(crate) struct SessionSpawnArgs {
     pub(crate) attached_thread: bool,
     pub(crate) startup: Option<Arc<startup::SessionStartup>>,
     pub(crate) config: Config,
+    pub(crate) request_country: codex_protocol::RequestCountry,
     pub(crate) prompt_cache_key: PromptCacheKey,
     pub(crate) allow_provider_model_fallback: bool,
     pub(crate) instructions: SessionInstructions,
@@ -607,6 +608,7 @@ impl Session {
                 thread_id: self.thread_id(),
                 tools: state.persisted_dynamic_tools.to_vec(),
             })),
+            observation_clock_floor_ms: None,
             multi_agent_version: self.multi_agent_version(),
             last_started_turn_id: state.last_started_turn_id.clone(),
             turn_attribution: state.turn_attribution.clone(),
@@ -704,6 +706,7 @@ impl Session {
             attached_thread,
             startup,
             config,
+            request_country,
             prompt_cache_key,
             allow_provider_model_fallback,
             instructions,
@@ -1029,6 +1032,7 @@ impl Session {
             turn_extension_init,
             provider: provider_auth.model_provider(config.model_provider.clone()),
             step_settings: Arc::new(StepSettings {
+                request_country,
                 collaboration_mode,
                 reasoning_summary: config.model_reasoning_summary,
                 service_tier: config.service_tier.clone(),
@@ -1970,6 +1974,13 @@ impl Session {
         turn_context: &Arc<TurnContext>,
         rollout_items: &[RolloutItem],
     ) -> Option<PreviousTurnSettings> {
+        if let Some(history) = &self.realtime_history {
+            history
+                .lock()
+                .await
+                .observation_clock
+                .restore(rollout_items);
+        }
         let rollout_reconstruction::RolloutReconstruction {
             mut history,
             rejected_audio_file_ids,
@@ -2953,8 +2964,8 @@ impl Session {
     }
 
     pub(crate) async fn send_event_raw(&self, event: Event) {
-        self.send_event_raw_with_persistence(event, /*persist*/ true)
-            .await;
+        // Keep event persistence out of callers' stack frames.
+        Box::pin(self.send_event_raw_with_persistence(event, /*persist*/ true)).await;
     }
 
     /// Delivers an event without creating a local rollout for a thread that has not materialized.
@@ -4643,6 +4654,7 @@ impl Session {
         Ok(Arc::new(StepContext {
             sampled_through_sequence: None,
             serving_assessment: None,
+            turn_cancellation: cancellation_token.clone(),
             preempt: turn_context
                 .config
                 .features
@@ -4736,6 +4748,8 @@ impl Session {
         for mut recording in pending {
             let _ = recording.changed().await;
         }
+        let mut delivery = communication.delivery.as_ref();
+        let mut result_write = None;
         {
             let mut state = self.state.lock().await;
             state.current_time_reminder.note_recorded_items(&items);
@@ -4744,7 +4758,9 @@ impl Session {
                 model_info.truncation_policy.into(),
             );
         }
-        let result_write = communication.consumed(self.thread_id);
+        if let Some(delivery) = delivery.take() {
+            result_write = delivery.consumed(self.thread_id);
+        }
         let saved = self
             .persist_rollout_items(&[
                 RolloutItem::InterAgentCommunicationMetadata {
@@ -4875,6 +4891,10 @@ impl Session {
         // Wait for accepted updates to finish persisting, then keep later updates from
         // overtaking the current settings snapshot while its checkpoint is written.
         let _settings_guard = thread_settings::acquire_persistence_lock(self).await;
+        let observation_clock_floor_ms = match &self.realtime_history {
+            Some(history) => history.lock().await.observation_clock.floor_ms(),
+            None => None,
+        };
         let (compacted_item, world_state_baseline, started_item) = {
             let mut state = self.state.lock().await;
             let complete_replacement =
@@ -4954,6 +4974,10 @@ impl Session {
             state
                 .history
                 .set_world_state_baseline(world_state_baseline.clone());
+            let resume_metadata = CompactionResumeMetadata {
+                observation_clock_floor_ms,
+                ..self.compaction_resume_metadata(&state)
+            };
             let compacted_item = CompactedItem {
                 message: metadata.message,
                 replacement_history: Some(replacement_history),
@@ -4966,7 +4990,7 @@ impl Session {
                 window_id: Some(metadata.window_ids.window_id),
                 compaction_response_id: metadata.compaction_response_id,
                 latest_token_usage_record: state.latest_token_usage_record.clone(),
-                resume_metadata: Some(self.compaction_resume_metadata(&state)),
+                resume_metadata: Some(resume_metadata),
             };
             (compacted_item, world_state_baseline, started_item)
         };
@@ -5630,6 +5654,7 @@ impl Session {
         turn_context: &TurnContext,
         settings: &ResolvedStepSettings,
         incomplete: &ResponseIncompleteError,
+        charge: crate::client_common::SamplingCharge,
     ) {
         if let Some(response_id) = &incomplete.response_id {
             self.record_response_token_usage(
@@ -5644,7 +5669,10 @@ impl Session {
             .record_token_usage_info(
                 turn_context,
                 settings,
-                incomplete.token_usage.as_ref(),
+                crate::client_common::SamplingUsage {
+                    provider: incomplete.token_usage.clone(),
+                    charge,
+                },
                 TokenUsageContext::SpendingOnly,
             )
             .await;
@@ -5653,14 +5681,14 @@ impl Session {
     pub(crate) async fn update_token_usage_info(
         &self,
         turn_context: &TurnContext,
-        token_usage: Option<&TokenUsage>,
+        usage: crate::client_common::SamplingUsage,
         includes_reasoning: bool,
     ) -> CodexResult<()> {
         let result = self
             .record_token_usage_info(
                 turn_context,
                 &turn_context.initial_settings,
-                token_usage,
+                usage,
                 TokenUsageContext::Sampling {
                     includes_reasoning,
                     input_item_count: 0,
@@ -5719,10 +5747,10 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         settings: &ResolvedStepSettings,
-        token_usage: Option<&TokenUsage>,
+        usage: crate::client_common::SamplingUsage,
         context: TokenUsageContext,
     ) -> CodexResult<()> {
-        if let Some(token_usage) = token_usage {
+        let token_info = if let Some(token_usage) = usage.provider.as_ref() {
             let token_info = {
                 let mut state = self.state.lock().await;
                 match context {
@@ -5775,24 +5803,26 @@ impl Session {
                     token_usage,
                 );
             }
-            let budget_result = self
-                .record_rollout_budget_usage(&turn_context.sub_id, token_usage)
-                .await;
-            if let Some(token_info) = token_info.as_ref() {
-                for contributor in self.services.extensions.token_usage_contributors() {
-                    contributor
-                        .on_token_usage(
-                            &self.services.session_extension_data,
-                            &self.services.thread_extension_data,
-                            turn_context.extension_data.as_ref(),
-                            token_info,
-                        )
-                        .await;
-                }
+            token_info
+        } else {
+            None
+        };
+        let budget_result = self
+            .record_rollout_budget_usage(&turn_context.sub_id, &usage)
+            .await;
+        if let Some(token_info) = token_info.as_ref() {
+            for contributor in self.services.extensions.token_usage_contributors() {
+                contributor
+                    .on_token_usage(
+                        &self.services.session_extension_data,
+                        &self.services.thread_extension_data,
+                        turn_context.extension_data.as_ref(),
+                        token_info,
+                    )
+                    .await;
             }
-            budget_result?;
         }
-        Ok(())
+        budget_result
     }
 
     pub(crate) async fn recompute_token_usage(&self, turn_context: &TurnContext) {
