@@ -32,6 +32,7 @@ use codex_tui::AppExitInfo;
 use codex_tui::Cli as TuiCli;
 use codex_tui::ExitReason;
 use codex_tui::UpdateAction;
+use codex_tui::resolve_remote_endpoint;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_cli::CliConfigOverrides;
 use codex_utils_cli::ProfileV2Name;
@@ -788,7 +789,11 @@ fn handle_app_exit(
     };
 
     let update_action = exit_info.update_action;
-    if !matches!(update_action, Some(UpdateAction::Daemon(_))) {
+    if matches!(update_action, Some(UpdateAction::Daemon(_))) {
+        for warning in exit_info.archive_warnings {
+            eprintln!("{warning}");
+        }
+    } else {
         let color_enabled = supports_color::on(Stream::Stdout).is_some();
         for line in exit_info.format_exit_messages(color_enabled) {
             println!("{line}");
@@ -1193,11 +1198,16 @@ async fn dispatch_cli(
                 .await??;
         }
         Some(Subcommand::Exec(mut exec_cli)) => {
-            reject_remote_mode_for_subcommand(
-                root_remote.as_deref(),
-                root_remote_auth_token_env.as_deref(),
-                "exec",
-            )?;
+            if let Some(root_endpoint) = &root_remote
+                && let Some(exec_endpoint) = &exec_cli.remote
+                && root_endpoint != exec_endpoint
+            {
+                anyhow::bail!("`codex exec` received conflicting remote server endpoints");
+            }
+            exec_cli.remote = exec_cli.remote.or(root_remote);
+            exec_cli.remote_auth_token_env = exec_cli
+                .remote_auth_token_env
+                .or(root_remote_auth_token_env);
             exec_cli
                 .shared
                 .inherit_exec_root_options(&interactive.shared);
@@ -2536,26 +2546,6 @@ async fn print_app_server_remote_control_output(
     Ok(())
 }
 
-fn read_remote_auth_token_from_env_var_with<F>(
-    env_var_name: &str,
-    get_var: F,
-) -> anyhow::Result<String>
-where
-    F: FnOnce(&str) -> Result<String, std::env::VarError>,
-{
-    let auth_token = get_var(env_var_name)
-        .map_err(|_| anyhow::anyhow!("environment variable `{env_var_name}` is not set"))?;
-    let auth_token = auth_token.trim().to_string();
-    if auth_token.is_empty() {
-        anyhow::bail!("environment variable `{env_var_name}` is empty");
-    }
-    Ok(auth_token)
-}
-
-fn read_remote_auth_token_from_env_var(env_var_name: &str) -> anyhow::Result<String> {
-    read_remote_auth_token_from_env_var_with(env_var_name, |name| std::env::var(name))
-}
-
 async fn run_interactive_tui(
     mut interactive: TuiCli,
     remote: Option<String>,
@@ -2667,41 +2657,6 @@ where
             }
         }
     }
-}
-
-fn resolve_remote_endpoint(
-    remote: Option<String>,
-    remote_auth_token_env: Option<String>,
-) -> std::io::Result<Option<codex_tui::RemoteAppServerEndpoint>> {
-    let mut remote_endpoint = remote
-        .as_deref()
-        .map(codex_tui::resolve_remote_addr)
-        .transpose()
-        .map_err(std::io::Error::other)?;
-    if let Some(remote_auth_token_env) = remote_auth_token_env {
-        let Some(endpoint) = remote_endpoint.as_mut() else {
-            return Err(std::io::Error::other(
-                "`--remote-auth-token-env` requires `--remote`.",
-            ));
-        };
-        if !codex_tui::remote_addr_supports_auth_token(endpoint) {
-            return Err(std::io::Error::other(
-                "`--remote-auth-token-env` requires a `wss://` or loopback `ws://` remote.",
-            ));
-        }
-        let auth_token = read_remote_auth_token_from_env_var(&remote_auth_token_env)
-            .map_err(std::io::Error::other)?;
-        let codex_tui::RemoteAppServerEndpoint::WebSocket {
-            auth_token: slot, ..
-        } = endpoint
-        else {
-            return Err(std::io::Error::other(
-                "`--remote-auth-token-env` requires a `wss://` or loopback `ws://` remote.",
-            ));
-        };
-        *slot = Some(auth_token);
-    }
-    Ok(remote_endpoint)
 }
 
 fn is_remote_auth_usage_error(err: &std::io::Error) -> bool {
@@ -3880,6 +3835,7 @@ enabled = true
                 thread_id,
                 thread_name: thread_name.map(str::to_string),
             }),
+            archive_warnings: Vec::new(),
             disconnect_info: None,
             update_action: None,
             exit_reason: ExitReason::UserRequested,
@@ -3892,6 +3848,7 @@ enabled = true
             token_usage: TokenUsage::default(),
             thread_id: None,
             resume_hint: None,
+            archive_warnings: Vec::new(),
             disconnect_info: None,
             update_action: None,
             exit_reason: ExitReason::UserRequested,
@@ -3952,6 +3909,7 @@ enabled = true
             token_usage: TokenUsage::default(),
             thread_id: Some(ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap()),
             resume_hint: None,
+            archive_warnings: Vec::new(),
             disconnect_info: None,
             update_action: None,
             exit_reason: ExitReason::Fatal("boom".to_string()),
@@ -4620,34 +4578,6 @@ enabled = true
         )
         .expect_err("non-interactive app-server subcommands should reject --remote-auth-token-env");
         assert!(err.to_string().contains("generate-internal-json-schema"));
-    }
-
-    #[test]
-    fn read_remote_auth_token_from_env_var_reports_missing_values() {
-        let err = read_remote_auth_token_from_env_var_with("CODEX_REMOTE_AUTH_TOKEN", |_| {
-            Err(std::env::VarError::NotPresent)
-        })
-        .expect_err("missing env vars should be rejected");
-        assert!(err.to_string().contains("is not set"));
-    }
-
-    #[test]
-    fn read_remote_auth_token_from_env_var_trims_values() {
-        let auth_token =
-            read_remote_auth_token_from_env_var_with("CODEX_REMOTE_AUTH_TOKEN", |_| {
-                Ok("  bearer-token  ".to_string())
-            })
-            .expect("env var should parse");
-        assert_eq!(auth_token, "bearer-token");
-    }
-
-    #[test]
-    fn read_remote_auth_token_from_env_var_rejects_empty_values() {
-        let err = read_remote_auth_token_from_env_var_with("CODEX_REMOTE_AUTH_TOKEN", |_| {
-            Ok(" \n\t ".to_string())
-        })
-        .expect_err("empty env vars should be rejected");
-        assert!(err.to_string().contains("is empty"));
     }
 
     #[test]
