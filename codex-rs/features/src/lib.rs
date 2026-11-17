@@ -455,6 +455,8 @@ pub enum Feature {
     GuardianRootHandoffContext,
     /// Review state-changing MAv2 calls and preserve native calls in Guardian history.
     GuardianNativeMultiAgentHistory,
+    /// Include the verified enclosing invocation in nested Guardian approvals.
+    GuardianNestedApprovalContext,
     /// Include completed node_repl or cua_repl Code Mode responses in Guardian reviews.
     GuardianEnhancedNodeReplTranscripts,
     /// Include completed node_repl or cua_repl Code Mode response images in Guardian reviews.
@@ -485,6 +487,8 @@ pub enum Feature {
     ReasoningEffortOverride,
     /// Add current-time reminders to model-visible context.
     CurrentTimeReminder,
+    /// Use UTC for the date in model-visible environment context.
+    UtcEnvironmentDate,
     /// Report failed clock reads to the model without failing the turn.
     NonfatalClockReadErrors,
     /// Route MCP tool approval prompts through the MCP elicitation request path.
@@ -2211,6 +2215,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::GuardianNestedApprovalContext,
+        key: "guardian_nested_approval_context",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::GuardianEnhancedNodeReplTranscripts,
         key: "guardian_enhanced_node_repl_transcripts",
         stage: Stage::UnderDevelopment,
@@ -2297,6 +2307,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::CurrentTimeReminder,
         key: "current_time_reminder",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::UtcEnvironmentDate,
+        key: "utc_environment_date",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
