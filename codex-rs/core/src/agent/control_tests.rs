@@ -1495,6 +1495,9 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
             assert!(harness.manager.get_thread(parent_thread_id).await.is_err());
             None
         }
+        V2ReloadRoute::RevokedChildProvider | V2ReloadRoute::RevokedParentProvider => {
+            unreachable!("the reload preservation fixture accepts only live authorization routes")
+        }
     };
     let reloaded_child = harness
         .manager
@@ -1506,6 +1509,11 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
         match route {
             V2ReloadRoute::Sender => germany,
             V2ReloadRoute::NestedParent => united_states,
+            V2ReloadRoute::RevokedChildProvider | V2ReloadRoute::RevokedParentProvider => {
+                unreachable!(
+                    "the reload preservation fixture accepts only live authorization routes"
+                )
+            }
         },
     );
     if matches!(route, V2ReloadRoute::Sender) {
@@ -1881,28 +1889,30 @@ async fn cold_resume_with_thread_instructions_preserves_lazy_v2_child_inheritanc
             Arc::make_mut(&mut Arc::make_mut(&mut issuing_step).settings),
             |selected| selected.request_country = issuing_country,
         );
-        SendMessageHandler
-            .handle(ToolInvocation {
-                session: Arc::clone(session),
-                turn,
-                step_context: issuing_step,
-                cancellation_token: CancellationToken::new(),
-                tracker: Default::default(),
-                call_id: "queue-only-cold-load".to_string(),
-                tool_name: codex_tools::ToolName::plain("send_message"),
-                source: ToolCallSource::DirectPlaintextMessage,
-                payload: ToolPayload::Function {
-                    arguments: serde_json::json!({
-                        "target": target_thread_id.to_string(),
-                        "message": "hello after resume",
-                    })
-                    .to_string(),
-                },
-                native_call: None,
-                environments: Default::default(),
-            })
-            .await
-            .expect("queue-only message should reload the grandchild");
+        SendMessageHandler::new(
+            crate::tools::handlers::multi_agent_message::AgentMessageRoute::Native,
+        )
+        .handle(ToolInvocation {
+            session: Arc::clone(session),
+            turn,
+            step_context: issuing_step,
+            cancellation_token: CancellationToken::new(),
+            tracker: Default::default(),
+            call_id: "queue-only-cold-load".to_string(),
+            tool_name: codex_tools::ToolName::plain("send_message"),
+            source: ToolCallSource::DirectPlaintextMessage,
+            payload: ToolPayload::Function {
+                arguments: serde_json::json!({
+                    "target": target_thread_id.to_string(),
+                    "message": "hello after resume",
+                })
+                .to_string(),
+            },
+            native_call: None,
+            environments: Default::default(),
+        })
+        .await
+        .expect("queue-only message should reload the grandchild");
         assert_thread_not_loaded(&resumed_manager, worker_thread_id).await;
     } else {
         resumed_manager
@@ -6056,6 +6066,24 @@ async fn resume_agent_from_rollout_reopens_open_descendants_after_manager_shutdo
         .shutdown_agent_tree(parent_thread_id)
         .await
         .expect("tree shutdown after subtree resume should succeed");
+}
+
+/// Remove the deprecated parent hint in the legacy rollout. Recovery must use the
+/// persisted graph edge even when the other metadata contains a stale parent.
+fn clear_rollout_session_parent(rollout_path: &std::path::Path) {
+    let rollout = std::fs::read_to_string(rollout_path).expect("read rollout");
+    let (session_meta, remaining_lines) = rollout
+        .split_once('\n')
+        .expect("rollout should contain session metadata and history");
+    let mut session_meta =
+        codex_rollout::parse_rollout_line(session_meta).expect("parse session metadata");
+    let RolloutItem::SessionMeta(meta_line) = &mut session_meta.item else {
+        panic!("rollout should start with session metadata");
+    };
+    meta_line.meta.parent_thread_id = None;
+    let session_meta = serde_json::to_string(&session_meta).expect("serialize session metadata");
+    std::fs::write(rollout_path, format!("{session_meta}\n{remaining_lines}"))
+        .expect("write legacy rollout");
 }
 
 #[tokio::test]

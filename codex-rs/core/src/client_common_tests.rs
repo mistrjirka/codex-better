@@ -8,6 +8,7 @@ use codex_protocol::models::ConfigurationReasoning;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ImageReference;
+use codex_protocol::openai_models::ReasoningEffort;
 use pretty_assertions::assert_eq;
 use serde_json::value::RawValue;
 use std::sync::Arc;
@@ -126,6 +127,8 @@ fn non_openai_input_normalizer_owns_all_openai_only_cleanup() {
             encrypted_function_args: Some(vec!["ciphertext".to_string()]),
             call_id: "call-1".to_string(),
             internal_chat_message_metadata_passthrough: Some(Default::default()),
+            status: None,
+            encrypted_content: None,
         },
     ];
 
@@ -142,6 +145,8 @@ fn non_openai_input_normalizer_owns_all_openai_only_cleanup() {
             encrypted_function_args: None,
             call_id: "call-1".to_string(),
             internal_chat_message_metadata_passthrough: None,
+            status: None,
+            encrypted_content: None,
         }]
     );
 }
@@ -157,6 +162,8 @@ fn plaintext_agent_message_normalizer_rejects_encrypted_content() {
             encrypted_function_args: Some(vec!["ciphertext".to_string()]),
             call_id: "call-1".to_string(),
             internal_chat_message_metadata_passthrough: Some(Default::default()),
+            status: None,
+            encrypted_content: None,
         },
         ResponseItem::ConfigurationUpdate {
             reasoning: ConfigurationReasoning {

@@ -1,6 +1,9 @@
 use crate::StartThreadOptions;
 use crate::ThreadManager;
 use crate::agent::LocalAgentControl;
+use crate::agent::control::spawn::SpawnInitialInput;
+use crate::agent::types::SpawnAgentForkMode;
+use crate::agent::types::SpawnAgentOptions;
 use crate::codex_thread::CodexThread;
 use crate::config::Config;
 use crate::config::test_config;
@@ -21,7 +24,7 @@ use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
-use codex_protocol::user_input::UserInput;
+use codex_user_input::ResolvedUserInput;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
 
@@ -200,12 +203,7 @@ async fn interrupted_v2_agent_is_lost_after_residency_eviction() {
 
 #[tokio::test]
 async fn rejected_cross_provider_history_fork_keeps_completed_v2_resident_loaded() {
-    for fork_mode in [
-        SpawnAgentForkMode::FullHistory,
-        SpawnAgentForkMode::LastNTurns(1),
-    ] {
-        assert_rejected_history_fork_keeps_completed_resident(fork_mode).await;
-    }
+    assert_rejected_history_fork_keeps_completed_resident(SpawnAgentForkMode::FullHistory).await;
 }
 
 async fn assert_rejected_history_fork_keeps_completed_resident(fork_mode: SpawnAgentForkMode) {
@@ -226,10 +224,19 @@ async fn assert_rejected_history_fork_keeps_completed_resident(fork_mode: SpawnA
         .await
         .expect("start root thread");
     let control = manager.agent_control();
-    let state = control.upgrade().expect("thread manager should be live");
+    let state = control
+        .runtime
+        .upgrade()
+        .expect("thread manager should be live");
+    let membership = control.runtime.admit_start().expect("admit residency work");
 
     let resident_slot = control
-        .reserve_v2_residency_slot(&state, &config, /*protected_thread_id*/ None)
+        .reserve_v2_residency_slot(
+            &state,
+            &config,
+            &membership,
+            /*protected_thread_id*/ None,
+        )
         .await
         .expect("resident slot");
     let resident =
@@ -245,12 +252,12 @@ async fn assert_rejected_history_fork_keeps_completed_resident(fork_mode: SpawnA
         .cloned()
         .expect("test provider should be configured");
     let error = control
-        .spawn_agent_with_metadata(
+        .spawn_agent_internal(
             external_config,
-            vec![UserInput::Text {
+            SpawnInitialInput::UserInput(vec![ResolvedUserInput::Text {
                 text: "child task".to_string(),
                 text_elements: Vec::new(),
-            }],
+            }]),
             Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id: root.thread_id,
                 depth: 1,

@@ -1268,6 +1268,7 @@ fn outgoing_request_normalizes_agent_message_only_for_non_openai_provider() -> a
                 /*parent_thread_id*/ None,
                 TestCodexResponsesRequestKind::Turn,
             ),
+            /*include_internal*/ false,
         )
     };
 
@@ -1289,6 +1290,8 @@ fn outgoing_request_normalizes_agent_message_only_for_non_openai_provider() -> a
             }],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
+            status: None,
+            encrypted_content: None,
         }]
     );
     Ok(())

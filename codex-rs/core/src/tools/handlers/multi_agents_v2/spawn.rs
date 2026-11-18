@@ -34,6 +34,18 @@ impl Handler {
     }
 }
 
+// These tests exercise spawn routing directly without constructing a tool catalog.
+#[cfg(test)]
+impl Default for Handler {
+    fn default() -> Self {
+        Self::new(
+            SpawnAgentToolOptions::default(),
+            AgentMessageRoute::Native,
+            None,
+        )
+    }
+}
+
 impl ToolExecutor<ToolInvocation> for Handler {
     fn tool_name(&self) -> ToolName {
         ToolName::plain("spawn_agent")

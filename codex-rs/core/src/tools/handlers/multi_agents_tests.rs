@@ -1214,7 +1214,7 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
         json!(r#"<agent name="/root/test_process" />"#),
     );
 
-    SendMessageHandlerV2
+    SendMessageHandlerV2::new(AgentMessageRoute::Native)
         .handle(invocation(
             session.clone(),
             turn.clone(),
@@ -4240,7 +4240,7 @@ async fn setup_unloaded_v2_message_target(
         .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("root thread should start");
-    session.services.agent_control = manager.agent_control();
+    session.services.agent_control = Arc::new(manager.agent_control());
     session.thread_id = root.thread_id;
     set_turn_config(&mut turn, config.clone());
 
@@ -4257,26 +4257,30 @@ async fn setup_unloaded_v2_message_target(
     let target_thread_id = session
         .services
         .agent_control
-        .spawn_agent_with_metadata(
-            target_config,
-            vec![UserInput::Text {
-                text: "inspect this repo".to_string(),
-                text_elements: Vec::new(),
-            }],
-            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        .spawn(crate::agent::api::SpawnRequest {
+            caller: root.thread_id,
+            config: target_config,
+            input: crate::agent::api::AgentInput::UserInput(vec![
+                codex_user_input::ResolvedUserInput::Text {
+                    text: "inspect this repo".to_string(),
+                    text_elements: Vec::new(),
+                },
+            ]),
+            source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id: root.thread_id,
                 depth: 1,
                 agent_path: Some(target_path),
                 agent_nickname: None,
                 agent_role: None,
-            })),
-            crate::agent::control::SpawnAgentOptions {
+            }),
+            options: crate::agent::types::SpawnAgentOptions {
                 parent_thread_id: Some(root.thread_id),
                 ..Default::default()
             },
-        )
+        })
         .await
         .expect("worker spawn should succeed")
+        .0
         .thread_id;
     let stale_thread = manager
         .remove_thread(&target_thread_id)

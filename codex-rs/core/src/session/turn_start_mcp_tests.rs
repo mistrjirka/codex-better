@@ -330,7 +330,11 @@ async fn mcp_budget_stop_at_handoff(phase: McpPause) -> anyhow::Result<()> {
         step,
         Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
     );
-    let response = runtime.handle_tool_call(call, cancel);
+    let response = runtime.handle_direct_tool_call_with_source(
+        call,
+        crate::tools::router::ToolCallSource::Direct,
+        cancel,
+    );
     tokio::pin!(response);
     tokio::select! {
         () = observer.entered.notified() => {}
