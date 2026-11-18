@@ -2398,14 +2398,17 @@ async fn archived_untracked_threads_do_not_appear_in_agent_picker() -> Result<()
         .agent_navigation
         .begin_picker_refresh(primary_thread_id)
         .expect("picker refresh after missed archive");
-    app.apply_agent_picker_thread_refresh(
-        &app_server,
-        primary_thread_id,
-        request_id,
-        Ok(crate::app_event::AgentPickerThreadRefresh {
-            threads: Vec::new(),
-            archived_thread_ids: std::collections::HashSet::from([archived_thread_id]),
-        }),
+    assert!(
+        app.apply_agent_picker_thread_refresh(
+            &app_server,
+            primary_thread_id,
+            request_id,
+            Ok(crate::app_event::AgentPickerThreadRefresh {
+                threads: Vec::new(),
+                archived_thread_ids: std::collections::HashSet::from([archived_thread_id]),
+            }),
+        )
+        .is_none()
     );
     assert_eq!(
         app.thread_event_channels[&archived_thread_id].attachment(),
@@ -4991,8 +4994,10 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
     }
     let zoom = KeyEvent::from(KeyCode::Char('z'));
     keys!(prefix, zoom);
+    assert!(app.conversation_frame.side_pane().is_none());
     let zoomed = side_frame(&mut app, &mut tui, wide)?;
     keys!(prefix, zoom);
+    assert!(app.conversation_frame.side_pane().is_some());
     let restored = side_frame(&mut app, &mut tui, wide)?;
     assert_eq!(divider_at(&tui, 0), 197);
     keys!(prefix, zoom);
@@ -9176,6 +9181,8 @@ async fn make_test_app() -> Box<App> {
     let session_telemetry = test_session_telemetry(&config, model.as_str());
 
     Box::new(App {
+        statusline_picker: None,
+        statusline_metrics: Default::default(),
         provider_writes: HashMap::new(),
         feature_write_lock: Arc::default(),
         config_notification_test_generation: 0,
@@ -9246,6 +9253,7 @@ async fn make_test_app() -> Box<App> {
         daemon_cli_executable: None,
         pending_update_action: None,
         daemon_restart: None,
+        remote_control_pending: false,
         pending_shutdown_exit_thread_id: None,
         windows_sandbox: WindowsSandboxState::default(),
         thread_event_channels: HashMap::new(),
@@ -9320,6 +9328,8 @@ pub(super) async fn make_test_app_with_channels() -> (
 
     (
         Box::new(App {
+            statusline_picker: None,
+            statusline_metrics: Default::default(),
             provider_writes: HashMap::new(),
             feature_write_lock: Arc::default(),
             config_notification_test_generation: 0,
@@ -9390,6 +9400,7 @@ pub(super) async fn make_test_app_with_channels() -> (
             daemon_cli_executable: None,
             pending_update_action: None,
             daemon_restart: None,
+            remote_control_pending: false,
             pending_shutdown_exit_thread_id: None,
             windows_sandbox: WindowsSandboxState::default(),
             thread_event_channels: HashMap::new(),
@@ -9915,62 +9926,6 @@ async fn app_server_thread_replacement_clears_previous_transcript_before_replay(
     Ok(())
 }
 
-#[tokio::test]
-async fn snapshot_thread_switch_discards_queued_previous_history() -> Result<()> {
-    let (mut app, mut events, _op_rx) = make_test_app_with_channels().await;
-    app.transcript_cells = vec![plain_line_cell("Previous thread transcript")];
-    app.chat_widget
-        .add_plain_history_lines(vec![Line::from("Previous queued history")]);
-    let mut tui = crate::tui::test_support::make_test_tui()?;
-    let mut app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
-    let next_thread_id = ThreadId::new();
-    app.render_thread_snapshot(
-        &mut tui,
-        &app_server,
-        next_thread_id,
-        ThreadEventSnapshot {
-            delegated_turns: Vec::new(),
-            session: Some(test_thread_session(
-                next_thread_id,
-                test_path_buf("/tmp/next"),
-            )),
-            turns: vec![test_turn(
-                "next-turn",
-                TurnStatus::Completed,
-                vec![ThreadItemPayload::UserMessage {
-                    id: "next-user".to_string(),
-                    client_id: None,
-                    content: vec![AppServerUserInput::Text {
-                        text: "Next thread prompt".to_string(),
-                        text_elements: Vec::new(),
-                    }],
-                }],
-            )],
-            events: Vec::new(),
-            active_reasoning_item: None,
-            input_state: None,
-        },
-        /*resume_restored_queue*/ false,
-    )?;
-    assert_eq!(app.pending_thread_switch_resets, 1);
-    while let Ok(event) = events.try_recv() {
-        app.handle_event(&mut tui, &mut app_server, event).await?;
-    }
-    assert_eq!(app.pending_thread_switch_resets, 0);
-    let rendered = app
-        .render_transcript_lines_for_reflow(/*width*/ 80)
-        .lines
-        .iter()
-        .map(rendered_line_text)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(!rendered.contains("Previous thread transcript"));
-    assert!(!rendered.contains("Previous queued history"));
-    assert!(rendered.contains("Next thread prompt"));
-    app_server.shutdown().await?;
-    Ok(())
-}
-
 fn rendered_line_text(line: &crate::terminal_hyperlinks::HyperlinkLine) -> String {
     line.line
         .spans
@@ -10441,7 +10396,7 @@ async fn resizing_empty_transcript_schedules_settled_size_recheck() {
     );
 }
 
-fn test_turn(turn_id: &str, status: TurnStatus, items: Vec<ThreadItemPayload>) -> Turn {
+pub(super) fn test_turn(turn_id: &str, status: TurnStatus, items: Vec<ThreadItemPayload>) -> Turn {
     Turn {
         id: turn_id.to_string(),
         root_turn_id: None,

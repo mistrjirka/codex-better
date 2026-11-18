@@ -142,7 +142,7 @@ impl LocalAgentControl {
     pub(crate) async fn spawn_agent_with_metadata(
         &self,
         config: Config,
-        initial_input: Vec<UserInput>,
+        initial_input: Vec<ResolvedUserInput>,
         source: SessionSource,
         options: SpawnAgentOptions,
     ) -> CodexResult<LiveAgent> {
@@ -182,8 +182,8 @@ async fn test_config() -> (TempDir, Config) {
     test_config_with_cli_overrides(Vec::new()).await
 }
 
-fn text_input(text: &str) -> Vec<UserInput> {
-    vec![UserInput::Text {
+fn text_input(text: &str) -> Vec<ResolvedUserInput> {
+    vec![ResolvedUserInput::Text {
         text: text.to_string(),
         text_elements: Vec::new(),
     }]
@@ -585,14 +585,7 @@ async fn assert_thread_not_loaded(manager: &ThreadManager, thread_id: ThreadId) 
 async fn send_input_errors_when_manager_dropped() {
     let control = LocalAgentControl::default();
     let err = control
-        .send_input(
-            ThreadId::new(),
-            vec![UserInput::Text {
-                text: "hello".to_string(),
-                text_elements: Vec::new(),
-            }],
-            Default::default(),
-        )
+        .send_input(ThreadId::new(), text_input("hello"), Default::default())
         .await
         .expect_err("send_input should fail without a manager");
     assert_eq!(
@@ -972,14 +965,7 @@ async fn send_input_errors_when_thread_missing() {
     let thread_id = ThreadId::new();
     let err = harness
         .control
-        .send_input(
-            thread_id,
-            vec![UserInput::Text {
-                text: "hello".to_string(),
-                text_elements: Vec::new(),
-            }],
-            Default::default(),
-        )
+        .send_input(thread_id, text_input("hello"), Default::default())
         .await
         .expect_err("send_input should fail for missing thread");
     assert_matches!(
@@ -1064,10 +1050,7 @@ async fn send_input_submits_user_message() {
             caller: ThreadId::new(),
             target: AgentTarget::Id(thread_id),
             resume_config: harness.config.clone(),
-            input: AgentInput::UserInput(vec![UserInput::Text {
-                text: "hello from tests".to_string(),
-                text_elements: Vec::new(),
-            }]),
+            input: AgentInput::UserInput(text_input("hello from tests")),
             start_options: Default::default(),
         })
         .await

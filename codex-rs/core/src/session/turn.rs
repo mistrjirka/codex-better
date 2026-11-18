@@ -102,7 +102,6 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::PlanItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::build_hook_prompt_message;
-use codex_protocol::models::AudioReference;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::MessagePhase;
@@ -136,6 +135,7 @@ use codex_tools::DiscoverableTool;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use codex_tools::filter_request_plugin_install_discoverable_tools_for_client;
+use codex_user_input::ResolvedUserInput;
 use codex_utils_path_uri::PathUri;
 use codex_utils_stream_parser::AssistantTextChunk;
 use codex_utils_stream_parser::AssistantTextStreamParser;
@@ -303,7 +303,7 @@ pub(crate) async fn run_turn(
         return Ok(None);
     }
 
-    let user_input = turn_user_input(&input);
+    let user_input = input_for_extensions(&input);
     let allow_plugin_mentions =
         !crate::guardian::is_basic_session_source(&turn_context.session_source);
     let McpStartupRequirements {
@@ -594,7 +594,7 @@ pub(crate) async fn run_turn(
                 .await?
             }
             Some(_) | None => {
-                let pending_user_input = turn_user_input(&pending_input);
+                let pending_user_input = input_for_extensions(&pending_input);
                 if allow_plugin_mentions {
                     required_plugins.extend(crate::plugins::collect_explicit_plugin_ids(
                         &pending_user_input,
@@ -1169,7 +1169,7 @@ pub(crate) fn recordable_inputs<'a>(
                 && turn_input_has_uploaded_audio_file(&item)
                 && let TurnInput::UserInput { content, .. } = item.to_mut()
             {
-                content.retain(|part| !is_uploaded_audio_file(part));
+                content.retain(|part| !part.is_uploaded_audio_file());
                 if content.is_empty() {
                     return None;
                 }
@@ -1180,7 +1180,7 @@ pub(crate) fn recordable_inputs<'a>(
 }
 
 fn turn_input_has_uploaded_audio_file(input: &TurnInput) -> bool {
-    matches!(input, TurnInput::UserInput { content, .. } if content.iter().any(is_uploaded_audio_file))
+    matches!(input, TurnInput::UserInput { content, .. } if content.iter().any(ResolvedUserInput::is_uploaded_audio_file))
 }
 
 fn unsupported_uploaded_audio_error() -> CodexErr {
@@ -1189,16 +1189,8 @@ fn unsupported_uploaded_audio_error() -> CodexErr {
     )
 }
 
-fn is_uploaded_audio_file(input: &UserInput) -> bool {
-    matches!(
-        input,
-        UserInput::Audio {
-            audio: AudioReference::File { .. }
-        }
-    )
-}
-
-pub(crate) fn turn_user_input(input: &[TurnInput]) -> Vec<UserInput> {
+/// Extensions and telemetry consume the protocol view, including the original mention and path labels.
+fn input_for_extensions(input: &[TurnInput]) -> Vec<UserInput> {
     input
         .iter()
         .filter_map(|item| match item {
@@ -1208,7 +1200,7 @@ pub(crate) fn turn_user_input(input: &[TurnInput]) -> Vec<UserInput> {
             | TurnInput::InterAgentCommunication(_) => None,
         })
         .flatten()
-        .cloned()
+        .map(ResolvedUserInput::to_user_input)
         .collect()
 }
 
@@ -1568,9 +1560,7 @@ async fn track_turn_resolved_config_analytics(
                     | TurnInput::InterAgentCommunication(_) => None,
                 })
                 .flatten()
-                .filter(|item| {
-                    matches!(item, UserInput::Image { .. } | UserInput::LocalImage { .. })
-                })
+                .filter(|item| item.is_image())
                 .count(),
             submission_type: None,
             ephemeral: thread_config.ephemeral,
@@ -3177,20 +3167,17 @@ async fn try_run_sampling_request(
                     preempt = CancellationToken::new();
                     continue;
                 }
-                if stream.settlement_started.load(Ordering::Acquire) {
-                    wait_for_bill_only = streaming && stream.interrupt.is_none();
-                } else {
-                    let Some(interrupt) = stream.interrupt.take() else {
-                        // TODO: Reconcile any response item already being presented to the client.
-                        break Ok(SamplingRequestResult {
-                            needs_follow_up: true,
-                            mailbox_preempted: false,
-                            last_agent_message,
-                        });
-                    };
-                    if step_context.settings.model_info.use_responses_lite {
-                        let _ = interrupt.send(codex_api::ResponseInterrupt::Drain);
-                    }
+                if stream.interrupt.is_none() {
+                    // Stop upstream polling, but keep receiving until any completion already
+                    // observed by the mapper has finished accounting.
+                    wait_for_bill_only =
+                        streaming || !stream.settlement_started.load(Ordering::Acquire);
+                    stream.consumer_dropped.cancel();
+                } else if !stream.settlement_started.load(Ordering::Acquire)
+                    && let Some(interrupt) = stream.interrupt.take()
+                    && step_context.settings.model_info.use_responses_lite
+                {
+                    let _ = interrupt.send(codex_api::ResponseInterrupt::Drain);
                 }
                 // A steer cannot start another request before the accounting owner returns its decision.
                 preempt = CancellationToken::new();
@@ -3202,6 +3189,13 @@ async fn try_run_sampling_request(
 
         let event = SamplingStream::accept_for_turn(event, &cancellation_token);
         let Some(crate::client_common::SamplingEvent { event, hook_output }) = event else {
+            if stream.consumer_dropped.is_cancelled() {
+                break Ok(SamplingRequestResult {
+                    needs_follow_up: true,
+                    mailbox_preempted: *draining_for_mailbox,
+                    last_agent_message,
+                });
+            }
             break Err(CodexErr::Stream(
                 "stream closed before response.completed".into(),
             ));
@@ -3237,14 +3231,7 @@ async fn try_run_sampling_request(
 
         // A steer can cut off unread items on an HTTP stream while the owner posts its bill.
         // Consume the terminal accounting decision before opening the follow-up request.
-        if wait_for_bill_only {
-            if matches!(event, ResponseEvent::Completed { .. }) {
-                break Ok(SamplingRequestResult {
-                    needs_follow_up: true,
-                    mailbox_preempted: *draining_for_mailbox,
-                    last_agent_message,
-                });
-            }
+        if wait_for_bill_only && !matches!(event, ResponseEvent::Completed { .. }) {
             continue;
         }
 
@@ -3435,21 +3422,19 @@ async fn try_run_sampling_request(
                         conversation.id = %sess.thread_id,
                         turn.id = %turn_context.sub_id,
                     );
-                    if stream.settlement_started.load(Ordering::Acquire) {
-                        wait_for_bill_only = streaming
-                            && !(step_context.settings.model_info.use_responses_lite
-                                && stream.interrupt.is_some());
-                    } else if step_context.settings.model_info.use_responses_lite
-                        && let Some(interrupt) = stream.interrupt.take()
+                    if step_context.settings.model_info.use_responses_lite
+                        && stream.interrupt.is_some()
                     {
-                        // Completion can already be buffered when the interrupt receiver closes.
-                        let _ = interrupt.send(codex_api::ResponseInterrupt::Drain);
+                        if !stream.settlement_started.load(Ordering::Acquire)
+                            && let Some(interrupt) = stream.interrupt.take()
+                        {
+                            // Completion can already be buffered when the interrupt receiver closes.
+                            let _ = interrupt.send(codex_api::ResponseInterrupt::Drain);
+                        }
                     } else {
-                        break Ok(SamplingRequestResult {
-                            needs_follow_up: true,
-                            mailbox_preempted: true,
-                            last_agent_message,
-                        });
+                        wait_for_bill_only =
+                            streaming || !stream.settlement_started.load(Ordering::Acquire);
+                        stream.consumer_dropped.cancel();
                     }
                     // Keep the response ID and terminal decision. Later tools receive a denial.
                     *draining_for_mailbox = true;
@@ -3667,6 +3652,13 @@ async fn try_run_sampling_request(
                 should_emit_token_count = true;
                 if let Err(err) = budget_result {
                     break Err(err);
+                }
+                if wait_for_bill_only {
+                    break Ok(SamplingRequestResult {
+                        needs_follow_up: true,
+                        mailbox_preempted: *draining_for_mailbox,
+                        last_agent_message,
+                    });
                 }
                 if resampling.retry_pending {
                     response_completed = false;
