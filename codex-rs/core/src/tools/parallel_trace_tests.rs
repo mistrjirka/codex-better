@@ -66,7 +66,7 @@ async fn spawned_dispatch_preserves_caller_context(level: LevelFilter) -> anyhow
         // The unknown-tool result still crosses the real spawned dispatch boundary.
         runtime
             .clone()
-            .handle_tool_call(
+            .handle_direct_tool_call_with_source(
                 ToolCall {
                     tool_name: codex_tools::ToolName::plain("unknown_tool"),
                     call_id: "call-context".into(),
@@ -76,6 +76,7 @@ async fn spawned_dispatch_preserves_caller_context(level: LevelFilter) -> anyhow
                     encrypted_function_args: None,
                     native_call: None,
                 },
+                ToolCallSource::Direct,
                 CancellationToken::new(),
             )
             .await

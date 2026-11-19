@@ -4,31 +4,45 @@ use crate::agent::types::SpawnAgentForkMode;
 use crate::codex_thread::ThreadConfigSnapshot;
 use crate::thread_spawn::ThreadSpawnError;
 use crate::thread_spawn::ThreadSpawnRequest;
+use crate::tools::handlers::multi_agent_message::AgentMessageRoute;
 use crate::tools::handlers::multi_agents::collab_tool_call_status;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
-use crate::tools::handlers::multi_agents_spec::create_spawn_agent_tool_v2;
-use crate::tools::handlers::multi_agents_v2::message_tool::message_content;
+use crate::tools::handlers::multi_agents_spec::create_spawn_agent_tool_v2_for_route;
 use crate::turn_timing::now_unix_timestamp_ms;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_tools::ToolSpec;
 use std::num::NonZeroUsize;
 
-#[derive(Default)]
 pub(crate) struct Handler {
     options: SpawnAgentToolOptions,
+    message_route: AgentMessageRoute,
     description_override: Option<String>,
 }
 
 impl Handler {
     pub(crate) fn new(
         options: SpawnAgentToolOptions,
+        message_route: AgentMessageRoute,
         description_override: Option<String>,
     ) -> Self {
         Self {
             options,
+            message_route,
             description_override,
         }
+    }
+}
+
+// These tests exercise spawn routing directly without constructing a tool catalog.
+#[cfg(test)]
+impl Default for Handler {
+    fn default() -> Self {
+        Self::new(
+            SpawnAgentToolOptions::default(),
+            AgentMessageRoute::Native,
+            None,
+        )
     }
 }
 
@@ -38,7 +52,11 @@ impl ToolExecutor<ToolInvocation> for Handler {
     }
 
     fn spec(&self) -> ToolSpec {
-        create_spawn_agent_tool_v2(self.options.clone(), self.description_override.as_deref())
+        create_spawn_agent_tool_v2_for_route(
+            self.options.clone(),
+            self.description_override.as_deref(),
+            self.message_route,
+        )
     }
 
     fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
@@ -51,7 +69,7 @@ impl ToolExecutor<ToolInvocation> for Handler {
             let turn_id = invocation.step_context.turn.sub_id.clone();
             let call_id = invocation.call_id.clone();
             let started_at_ms = now_unix_timestamp_ms();
-            let result = handle_spawn_agent(invocation).await;
+            let result = handle_spawn_agent(invocation, self.message_route).await;
             let completed_at_ms = now_unix_timestamp_ms();
             let (status, receiver_thread_ids, agents_states) = match &result {
                 Ok((_, thread_id, agent_status, _)) => (
@@ -93,6 +111,7 @@ impl ToolExecutor<ToolInvocation> for Handler {
 
 async fn handle_spawn_agent(
     invocation: ToolInvocation,
+    message_route: AgentMessageRoute,
 ) -> Result<
     (
         SpawnAgentResult,
@@ -113,21 +132,75 @@ async fn handle_spawn_agent(
     let turn = &step_context.turn;
     let arguments = function_arguments(payload)?;
     let args: SpawnAgentArgs = parse_arguments(&arguments)?;
-    let fork_mode = args.fork_mode()?;
-    let message = message_content(args.message)?;
-    let role_name = args
-        .agent_type
-        .as_deref()
-        .map(str::trim)
-        .filter(|role| !role.is_empty());
+    message_route.validate_message(&args.message)?;
+    let fork_mode = if message_route == AgentMessageRoute::ExternalPlaintext {
+        // Different providers do not share message history. No fork is the
+        // default for this bridge, even when the caller omits fork_turns.
+        match args.fork_turns.as_deref().map(str::trim) {
+            None | Some("") | Some("none") => None,
+            Some(_) => {
+                return Err(FunctionCallError::RespondToModel(
+                    "Cross-provider agents require fork_turns=none or an omitted fork_turns"
+                        .to_string(),
+                ));
+            }
+        }
+    } else {
+        args.fork_mode()?
+    };
+    let role_name = message_route.validate_spawn_selection(
+        args.agent_type.as_deref(),
+        args.model.is_some(),
+        args.reasoning_effort.is_some(),
+    )?;
 
+    // An external plaintext bridge cannot spawn a first-party child. The
+    // configured role snapshot and user-owned provider allowlist both apply.
+    let selected_role = role_name.and_then(|name| turn.config.agent_roles.get(name));
+    if message_route == AgentMessageRoute::ExternalPlaintext && selected_role.is_none() {
+        return Err(FunctionCallError::RespondToModel(
+            "External agent_type must name a configured user agent role".to_string(),
+        ));
+    }
+    if let Some(role) = selected_role {
+        if let Some(provider_id) = role.model_provider.as_deref() {
+            let mut target_config = turn.config.as_ref().clone();
+            let baseline = target_config.subagent_model_provider_baseline();
+            target_config
+                .select_subagent_model_provider(&baseline, provider_id)
+                .map_err(|err| {
+                    FunctionCallError::RespondToModel(format!(
+                        "The requested agent provider is not authorized: {err}"
+                    ))
+                })?;
+            match message_route {
+                AgentMessageRoute::ExternalPlaintext
+                    if target_config.model_provider.is_openai() =>
+                {
+                    return Err(FunctionCallError::RespondToModel(
+                        "Use the standard spawn_agent tool for OpenAI agents".to_string(),
+                    ));
+                }
+                AgentMessageRoute::Native if !target_config.model_provider.is_openai() => {
+                    return Err(FunctionCallError::RespondToModel(
+                        "Use external_agents.spawn_agent for a non-OpenAI agent".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        } else if message_route == AgentMessageRoute::ExternalPlaintext {
+            return Err(FunctionCallError::RespondToModel(
+                "External agent_type has no explicit model provider".to_string(),
+            ));
+        }
+    }
     let spawned = crate::thread_spawn::spawn(
         &session,
         &step_context,
         &call_id,
         ThreadSpawnRequest {
             task_name: args.task_name,
-            message: agent_message_from_tool(message, &source),
+            message: agent_message_from_tool(args.message.clone(), &source),
             fork_mode: fork_mode.clone(),
             agent_type: args.agent_type.clone(),
             model: args.model,
@@ -193,6 +266,10 @@ async fn handle_spawn_agent(
 }
 
 impl CoreToolRuntime for Handler {
+    fn direct_tool_call_source_policy(&self) -> crate::tools::context::DirectToolCallSourcePolicy {
+        self.message_route.direct_tool_call_source_policy()
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }

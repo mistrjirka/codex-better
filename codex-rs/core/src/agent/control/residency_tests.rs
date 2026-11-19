@@ -1,10 +1,16 @@
+use super::ThreadEvictionOutcome;
 use crate::StartThreadOptions;
 use crate::ThreadManager;
 use crate::agent::LocalAgentControl;
+use crate::agent::control::spawn::SpawnInitialInput;
+use crate::agent::types::SpawnAgentForkMode;
+use crate::agent::types::SpawnAgentOptions;
 use crate::codex_thread::CodexThread;
 use crate::config::Config;
 use crate::config::test_config;
+use crate::session::SUBMISSION_CHANNEL_CAPACITY;
 use crate::thread_manager::ThreadManagerState;
+use assert_matches::assert_matches;
 use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_protocol::AgentPath;
@@ -20,6 +26,7 @@ use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
+use codex_user_input::ResolvedUserInput;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
 
@@ -75,10 +82,46 @@ async fn residency_slot_reservation_unloads_oldest_idle_v2_agent() {
         communication: communication.clone(),
         start_options: Default::default(),
     });
+    let injected = (0..=SUBMISSION_CHANNEL_CAPACITY)
+        .map(|index| {
+            let mut message = communication.clone();
+            message.content = format!("injected notice {index}");
+            message
+        })
+        .collect::<Vec<_>>();
+    let injection = first.thread.inject_response_items(
+        injected
+            .iter()
+            .map(InterAgentCommunication::to_model_input_item)
+            .collect(),
+    );
     tokio::pin!(delivery);
+    tokio::pin!(injection);
     assert!(futures::poll!(delivery.as_mut()).is_pending());
+    assert!(futures::poll!(injection.as_mut()).is_pending());
     drop(eviction_gate);
     delivery.await.expect("submit after eviction gate releases");
+    // Drain each accepted prefix while the batch yields, then attempt capacity eviction.
+    loop {
+        tokio::task::yield_now().await;
+        tokio::task::consume_budget().await;
+        if let std::task::Poll::Ready(result) = futures::poll!(injection.as_mut()) {
+            result.expect("inject after eviction gate releases");
+            break;
+        }
+        first
+            .thread
+            .update_thread_settings(ThreadSettingsOverrides::default())
+            .await
+            .expect("dispatch the accepted prefix");
+        assert_eq!(
+            state
+                .try_evict_v2_thread(Arc::clone(&first.thread), &membership)
+                .await
+                .unwrap(),
+            ThreadEvictionOutcome::Busy,
+        );
+    }
     first
         .thread
         .update_thread_settings(ThreadSettingsOverrides::default())
@@ -108,7 +151,11 @@ async fn residency_slot_reservation_unloads_oldest_idle_v2_agent() {
         .local_agent_runtime
         .mailboxes
         .take(first.thread_id, |_| true);
-    assert_eq!(retained, vec![communication.into()]);
+    let expected = std::iter::once(communication)
+        .chain(injected)
+        .map(Into::into)
+        .collect::<Vec<_>>();
+    assert_eq!(retained, expected);
     let second = spawn_v2_subagent(&control, &state, config, root.thread_id, "worker-2").await;
     second_slot.commit(second.thread_id);
 
@@ -194,6 +241,90 @@ async fn interrupted_v2_agent_is_lost_after_residency_eviction() {
         },
         Ok(_) => panic!("expected evicted thread to be missing"),
     }
+}
+
+#[tokio::test]
+async fn rejected_cross_provider_history_fork_keeps_completed_v2_resident_loaded() {
+    assert_rejected_history_fork_keeps_completed_resident(SpawnAgentForkMode::FullHistory).await;
+}
+
+async fn assert_rejected_history_fork_keeps_completed_resident(fork_mode: SpawnAgentForkMode) {
+    let mut config = test_config().await;
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    config.multi_agent_v2.max_concurrent_threads_per_session = 2;
+    let temp_home = tempfile::tempdir().expect("create temp home");
+    config.codex_home = temp_home.path().to_path_buf().try_into().unwrap();
+    config.cwd = temp_home.path().to_path_buf().try_into().unwrap();
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let root = manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .expect("start root thread");
+    let control = manager.agent_control();
+    let state = control
+        .runtime
+        .upgrade()
+        .expect("thread manager should be live");
+    let membership = control.runtime.admit_start().expect("admit residency work");
+
+    let resident_slot = control
+        .reserve_v2_residency_slot(
+            &state,
+            &config,
+            &membership,
+            /*protected_thread_id*/ None,
+        )
+        .await
+        .expect("resident slot");
+    let resident =
+        spawn_v2_subagent(&control, &state, config.clone(), root.thread_id, "resident").await;
+    resident_slot.commit(resident.thread_id);
+    mark_thread_completed(resident.thread.as_ref()).await;
+
+    let mut external_config = config.clone();
+    external_config.model_provider_id = "ollama".to_string();
+    external_config.model_provider = external_config
+        .model_providers
+        .get("ollama")
+        .cloned()
+        .expect("test provider should be configured");
+    let error = control
+        .spawn_agent_internal(
+            external_config,
+            SpawnInitialInput::UserInput(vec![ResolvedUserInput::Text {
+                text: "child task".to_string(),
+                text_elements: Vec::new(),
+            }]),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: root.thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            SpawnAgentOptions {
+                fork_parent_spawn_call_id: Some("cross-provider-fork".to_string()),
+                fork_mode: Some(fork_mode),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("cross-provider history fork should be rejected");
+
+    assert_matches!(
+        error.details(),
+        CodexErrorDetails::InvalidRequest(message)
+            if message == "history forks require the child to use the parent's exact model provider configuration; use fork_turns=\"none\" for a different provider"
+    );
+    manager
+        .get_thread(resident.thread_id)
+        .await
+        .expect("rejected fork must not unload the completed resident");
 }
 
 async fn spawn_v2_subagent(

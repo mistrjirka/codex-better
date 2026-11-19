@@ -32,10 +32,18 @@ use crate::init_state_db;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::session::SessionSettingsUpdate;
 use crate::session::step_context::StepContext;
+use crate::session::step_settings::StepSettingsUpdate;
+use crate::session::tests::update_selected_settings_for_test;
 use crate::thread_manager::ForkSnapshot;
 use crate::thread_manager::StartThreadOptions;
+use crate::tools::context::ToolCallSource;
+use crate::tools::context::ToolInvocation;
+use crate::tools::context::ToolPayload;
 use crate::tools::handlers::multi_agents_common::thread_spawn_source;
+use crate::tools::handlers::multi_agents_v2::SendMessageHandler;
+use crate::tools::registry::ToolExecutor;
 use assert_matches::assert_matches;
+use codex_config::CONFIG_TOML_FILE;
 use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::Instructions;
 use codex_extension_api::LoadInstructionsFuture;
@@ -52,6 +60,7 @@ use codex_login::CodexAuth;
 use codex_models_manager::manager::ModelCatalogSettings;
 use codex_models_manager::model_info::model_info_from_slug;
 use codex_protocol::AgentPath;
+use codex_protocol::RequestCountry;
 use codex_protocol::ResponseItemId;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
@@ -133,7 +142,7 @@ impl LocalAgentControl {
     pub(crate) async fn spawn_agent_with_metadata(
         &self,
         config: Config,
-        initial_input: Vec<UserInput>,
+        initial_input: Vec<ResolvedUserInput>,
         source: SessionSource,
         options: SpawnAgentOptions,
     ) -> CodexResult<LiveAgent> {
@@ -173,8 +182,8 @@ async fn test_config() -> (TempDir, Config) {
     test_config_with_cli_overrides(Vec::new()).await
 }
 
-fn text_input(text: &str) -> Vec<UserInput> {
-    vec![UserInput::Text {
+fn text_input(text: &str) -> Vec<ResolvedUserInput> {
+    vec![ResolvedUserInput::Text {
         text: text.to_string(),
         text_elements: Vec::new(),
     }]
@@ -576,14 +585,7 @@ async fn assert_thread_not_loaded(manager: &ThreadManager, thread_id: ThreadId) 
 async fn send_input_errors_when_manager_dropped() {
     let control = LocalAgentControl::default();
     let err = control
-        .send_input(
-            ThreadId::new(),
-            vec![UserInput::Text {
-                text: "hello".to_string(),
-                text_elements: Vec::new(),
-            }],
-            Default::default(),
-        )
+        .send_input(ThreadId::new(), text_input("hello"), Default::default())
         .await
         .expect_err("send_input should fail without a manager");
     assert_eq!(
@@ -963,14 +965,7 @@ async fn send_input_errors_when_thread_missing() {
     let thread_id = ThreadId::new();
     let err = harness
         .control
-        .send_input(
-            thread_id,
-            vec![UserInput::Text {
-                text: "hello".to_string(),
-                text_elements: Vec::new(),
-            }],
-            Default::default(),
-        )
+        .send_input(thread_id, text_input("hello"), Default::default())
         .await
         .expect_err("send_input should fail for missing thread");
     assert_matches!(
@@ -1045,19 +1040,22 @@ async fn send_input_submits_user_message() {
     let harness = AgentControlHarness::new().await;
     let (thread_id, thread) = harness.start_thread().await;
 
-    let submission_id = harness
-        .control
-        .send_input(
-            thread_id,
-            vec![UserInput::Text {
-                text: "hello from tests".to_string(),
-                text_elements: Vec::new(),
-            }],
-            Default::default(),
-        )
+    let control = thread
+        .session
+        .services
+        .local_agent_runtime
+        .control(thread.session.session_id());
+    let receipt = control
+        .send(SendRequest {
+            caller: ThreadId::new(),
+            target: AgentTarget::Id(thread_id),
+            resume_config: harness.config.clone(),
+            input: AgentInput::UserInput(text_input("hello from tests")),
+            start_options: Default::default(),
+        })
         .await
-        .expect("send_input should succeed");
-    assert!(!submission_id.is_empty());
+        .expect("a live recipient does not require a registered sender");
+    assert!(!receipt.submission_id.is_empty());
     wait_for_recorded_user_message(thread.as_ref(), "hello from tests").await;
 }
 
@@ -1269,6 +1267,8 @@ async fn cancelled_v2_send_finishes_reload_registration() {
 enum V2ReloadRoute {
     Sender,
     NestedParent,
+    RevokedChildProvider,
+    RevokedParentProvider,
 }
 
 async fn spawn_v2_reload_test_child(
@@ -1291,6 +1291,7 @@ async fn spawn_v2_reload_test_child(
             text_input("hello child"),
             source,
             SpawnAgentOptions {
+                request_country: parent.config_snapshot().await.request_country,
                 parent_thread_id: Some(parent.session.thread_id),
                 ..Default::default()
             },
@@ -1299,11 +1300,22 @@ async fn spawn_v2_reload_test_child(
         .expect("spawn_agent should succeed")
 }
 
+fn select_test_provider(config: &mut Config, provider_id: &str) {
+    config.model_provider_id = provider_id.to_string();
+    config.model_provider = config
+        .model_providers
+        .get(provider_id)
+        .cloned()
+        .expect("test provider should be configured");
+}
+
 async fn check_v2_agent_reload(route: V2ReloadRoute) {
     let (home, mut config) = test_config().await;
     let _ = config.features.enable(Feature::MultiAgentV2);
     let _ = config.features.enable(Feature::Sqlite);
     config.model = Some("gpt-5.6-sol".to_string());
+    let germany = RequestCountry::from_iso_code("DE").unwrap();
+    let united_states = RequestCountry::from_iso_code("US").unwrap();
     config.multi_agent_v2.max_concurrent_threads_per_session = 3;
     config.permissions.allow_login_shell = true;
     config
@@ -1316,6 +1328,7 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
     let root = harness
         .manager
         .start_thread(StartThreadOptions {
+            request_country: germany.clone(),
             history_mode: Some(ThreadHistoryMode::Paginated),
             client_mcp_extensions: client_mcp_extensions.clone(),
             user_instructions: Some(LoadedUserInstructions {
@@ -1333,6 +1346,7 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
         })
         .await
         .expect("start root thread");
+    assert_eq!(root.thread.config_snapshot().await.request_country, germany);
     let control = root
         .thread
         .session
@@ -1340,21 +1354,20 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
         .local_agent_runtime
         .control(root.thread.session.session_id());
     let parent_thread = match route {
-        V2ReloadRoute::Sender => root.thread,
-        V2ReloadRoute::NestedParent => {
-            let parent = spawn_v2_reload_test_child(
-                &control,
-                harness.config.clone(),
-                &root.thread,
-                "parent",
-            )
-            .await;
+        V2ReloadRoute::NestedParent | V2ReloadRoute::RevokedParentProvider => {
+            let mut parent_config = harness.config.clone();
+            if matches!(route, V2ReloadRoute::RevokedParentProvider) {
+                select_test_provider(&mut parent_config, "ollama");
+            }
+            let parent =
+                spawn_v2_reload_test_child(&control, parent_config, &root.thread, "parent").await;
             harness
                 .manager
                 .get_thread(parent.thread_id)
                 .await
                 .expect("nested parent should exist")
         }
+        V2ReloadRoute::Sender | V2ReloadRoute::RevokedChildProvider => root.thread,
     };
     let parent_thread_id = parent_thread.session.thread_id;
     let inherited_instructions = parent_thread.session.inherited_instructions().await;
@@ -1362,6 +1375,13 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
     assert!(inherited_instructions.thread.is_some());
     let mut child_config = harness.config.clone();
     child_config.model = Some("gpt-5.6-luna".to_string());
+    if matches!(
+        route,
+        V2ReloadRoute::Sender | V2ReloadRoute::RevokedChildProvider
+    ) {
+        select_test_provider(&mut child_config, "ollama");
+    }
+    let child_model_provider = child_config.model_provider.clone();
     let spawned_agent =
         spawn_v2_reload_test_child(&control, child_config, &parent_thread, "worker").await;
     let agent_path = spawned_agent
@@ -1392,7 +1412,6 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
         .await
         .expect("child metadata should be readable");
     assert_eq!(stored_child.history_mode, ThreadHistoryMode::Paginated);
-
     assert!(
         harness
             .manager
@@ -1417,12 +1436,17 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
     }
 
     let mut sender_config = harness.config.clone();
-    sender_config.model_provider_id = "ollama".to_string();
-    sender_config.model_provider = sender_config
-        .model_providers
-        .get("ollama")
-        .cloned()
-        .expect("ollama provider should be configured");
+    if matches!(route, V2ReloadRoute::Sender) {
+        let user_config = toml::from_str("subagent_model_provider_allowlist = [\"ollama\"]")
+            .expect("valid user config");
+        sender_config.config_layer_stack = sender_config
+            .config_layer_stack
+            .with_user_config(
+                &sender_config.codex_home.join(CONFIG_TOML_FILE),
+                user_config,
+            )
+            .expect("provider allowlist should be valid user config");
+    }
 
     let mut parent_turn = parent_thread.session.new_default_turn().await;
     let residency_pin = match route {
@@ -1446,10 +1470,14 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
                         parent_turn.config.cwd.clone(),
                         vec![selection],
                     )),
+                    step_settings: StepSettingsUpdate {
+                        request_country: Some(united_states.clone()),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 })
                 .await
-                .expect("save parent environments");
+                .expect("save parent environments and country");
             parent_thread.session.mark_interrupted();
             // The fixture has no task runner to finish the turn or consume child results.
             *parent_thread.session.active_turn.lock().await = None;
@@ -1467,12 +1495,27 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
             assert!(harness.manager.get_thread(parent_thread_id).await.is_err());
             None
         }
+        V2ReloadRoute::RevokedChildProvider | V2ReloadRoute::RevokedParentProvider => {
+            unreachable!("the reload preservation fixture accepts only live authorization routes")
+        }
     };
     let reloaded_child = harness
         .manager
         .get_thread(spawned_agent.thread_id)
         .await
         .expect("reloaded child thread should exist");
+    assert_eq!(
+        reloaded_child.config_snapshot().await.request_country,
+        match route {
+            V2ReloadRoute::Sender => germany,
+            V2ReloadRoute::NestedParent => united_states,
+            V2ReloadRoute::RevokedChildProvider | V2ReloadRoute::RevokedParentProvider => {
+                unreachable!(
+                    "the reload preservation fixture accepts only live authorization routes"
+                )
+            }
+        },
+    );
     if matches!(route, V2ReloadRoute::Sender) {
         assert_eq!(
             harness
@@ -1524,10 +1567,7 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
                 .info()
                 .clone(),
         ),
-        (
-            stored_child.model_provider,
-            harness.config.model_provider.clone()
-        ),
+        (stored_child.model_provider, child_model_provider),
         "residency reload must preserve the worker provider instead of inheriting its sender's provider",
     );
 
@@ -1731,10 +1771,12 @@ async fn cold_resume_with_thread_instructions_preserves_lazy_v2_child_inheritanc
     let (home, mut config) = test_config().await;
     let _ = config.features.enable(Feature::MultiAgentV2);
     let _ = config.features.enable(Feature::Sqlite);
+    let admitted_country = RequestCountry::from_iso_code("DE").unwrap();
     let harness = AgentControlHarness::new_with_config(home, config).await;
     let parent = harness
         .manager
         .start_thread(StartThreadOptions {
+            request_country: admitted_country.clone(),
             history_mode: Some(ThreadHistoryMode::Legacy),
             thread_instructions_provider: Some(Arc::new(TestThreadInstructionsProvider {
                 text: "initial thread instructions".into(),
@@ -1814,6 +1856,7 @@ async fn cold_resume_with_thread_instructions_preserves_lazy_v2_child_inheritanc
     });
     let resumed_parent = resumed_manager
         .start_thread(StartThreadOptions {
+            request_country: admitted_country.clone(),
             initial_history,
             session_source: Some(SessionSource::Exec),
             thread_instructions_provider: Some(provider.clone()),
@@ -1837,30 +1880,39 @@ async fn cold_resume_with_thread_instructions_preserves_lazy_v2_child_inheritanc
     assert_thread_not_loaded(&resumed_manager, worker_thread_id).await;
 
     if nested {
-        let turn = resumed_parent.thread.session.new_default_turn().await;
-        resumed_parent
-            .thread
-            .session
-            .services
-            .agent_control
-            .send(crate::SendRequest {
-                caller: parent_thread_id,
-                target: crate::AgentTarget::Id(target_thread_id),
-                resume_config: crate::agent::child_config::build_agent_resume_config(&turn)
-                    .expect("capture resume config"),
-                input: crate::AgentInput::Message {
-                    message: AgentMessage::Plaintext("hello after resume".to_string()),
-                    mode: MessageDeliveryMode::QueueOnly,
-                },
-                start_options: TurnStartOptions {
-                    root_turn_id: turn.turn_metadata_state.root_turn_id(),
-                    turn_trigger: turn.turn_metadata_state.current_turn_trigger(),
-                    cyber_access_program: turn.cyber_access_program,
-                    ..Default::default()
-                },
-            })
-            .await
-            .expect("message should reload the grandchild");
+        let session = &resumed_parent.thread.session;
+        let turn = session.new_default_turn().await;
+        assert_eq!(turn.request_country(), &admitted_country);
+        let mut issuing_step = StepContext::for_test(Arc::clone(&turn));
+        let issuing_country = RequestCountry::from_iso_code("US").unwrap();
+        update_selected_settings_for_test(
+            Arc::make_mut(&mut Arc::make_mut(&mut issuing_step).settings),
+            |selected| selected.request_country = issuing_country,
+        );
+        SendMessageHandler::new(
+            crate::tools::handlers::multi_agent_message::AgentMessageRoute::Native,
+        )
+        .handle(ToolInvocation {
+            session: Arc::clone(session),
+            turn,
+            step_context: issuing_step,
+            cancellation_token: CancellationToken::new(),
+            tracker: Default::default(),
+            call_id: "queue-only-cold-load".to_string(),
+            tool_name: codex_tools::ToolName::plain("send_message"),
+            source: ToolCallSource::DirectPlaintextMessage,
+            payload: ToolPayload::Function {
+                arguments: serde_json::json!({
+                    "target": target_thread_id.to_string(),
+                    "message": "hello after resume",
+                })
+                .to_string(),
+            },
+            native_call: None,
+            environments: Default::default(),
+        })
+        .await
+        .expect("queue-only message should reload the grandchild");
         assert_thread_not_loaded(&resumed_manager, worker_thread_id).await;
     } else {
         resumed_manager
@@ -1872,6 +1924,14 @@ async fn cold_resume_with_thread_instructions_preserves_lazy_v2_child_inheritanc
         .get_thread(target_thread_id)
         .await
         .expect("resumed target should be loaded");
+    assert_eq!(
+        resumed_target.config_snapshot().await.request_country,
+        if nested {
+            RequestCountry::UNKNOWN
+        } else {
+            admitted_country
+        },
+    );
     let inherited = resumed_target.session.inherited_instructions().await;
     let root_provider = resumed_parent
         .thread
@@ -2719,6 +2779,7 @@ async fn spawn_agent_fork_sanitizes_inherited_compaction_metadata() {
         next_item_ordinal: None,
         rejected_audio_file_ids: Default::default(),
         dynamic_tools: None,
+        observation_clock_floor_ms: None,
         multi_agent_version: Some(MultiAgentVersion::V2),
         last_started_turn_id: Some("parent-turn".to_string()),
         turn_attribution: Some(codex_history::TurnAttribution {
@@ -3885,6 +3946,7 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
                     next_item_ordinal: None,
                     rejected_audio_file_ids: Default::default(),
                     dynamic_tools: None,
+                    observation_clock_floor_ms: None,
                     multi_agent_version: Some(MultiAgentVersion::V2),
                     last_started_turn_id: None,
                     turn_attribution: None,
@@ -4022,6 +4084,7 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
                 next_item_ordinal: None,
                 rejected_audio_file_ids: Default::default(),
                 dynamic_tools: None,
+                observation_clock_floor_ms: None,
                 multi_agent_version: Some(MultiAgentVersion::V2),
                 last_started_turn_id: None,
                 turn_attribution: None,
@@ -4942,6 +5005,8 @@ async fn spawn_thread_subagent_uses_role_specific_nickname_candidates() {
         AgentRoleConfig {
             description: Some("Research role".to_string()),
             config_file: None,
+            model_provider: None,
+            model_catalog_json: None,
             nickname_candidates: Some(vec!["Atlas".to_string()]),
         },
     );
@@ -5119,6 +5184,7 @@ async fn resume_thread_subagent_restores_stored_metadata() {
 
     parent_thread
         .update_thread_settings(ThreadSettingsOverrides {
+            request_country: Some(RequestCountry::from_iso_code("US").unwrap()),
             environments: Some(TurnEnvironmentRequests::new(
                 harness.config.cwd.clone(),
                 Vec::new(),
@@ -5202,6 +5268,10 @@ async fn resume_thread_subagent_restores_stored_metadata() {
         roots
     );
     let resumed_snapshot = resumed_thread.config_snapshot().await;
+    assert_eq!(
+        resumed_snapshot.request_country,
+        RequestCountry::from_iso_code("US").unwrap()
+    );
     let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
         parent_thread_id: resumed_parent_thread_id,
         depth: resumed_depth,
@@ -5998,9 +6068,34 @@ async fn resume_agent_from_rollout_reopens_open_descendants_after_manager_shutdo
         .expect("tree shutdown after subtree resume should succeed");
 }
 
+/// Remove the deprecated parent hint in the legacy rollout. Recovery must use the
+/// persisted graph edge even when the other metadata contains a stale parent.
+fn clear_rollout_session_parent(rollout_path: &std::path::Path) {
+    let rollout = std::fs::read_to_string(rollout_path).expect("read rollout");
+    let (session_meta, remaining_lines) = rollout
+        .split_once('\n')
+        .expect("rollout should contain session metadata and history");
+    let mut session_meta =
+        codex_rollout::parse_rollout_line(session_meta).expect("parse session metadata");
+    let RolloutItem::SessionMeta(meta_line) = &mut session_meta.item else {
+        panic!("rollout should start with session metadata");
+    };
+    meta_line.meta.parent_thread_id = None;
+    let session_meta = serde_json::to_string(&session_meta).expect("serialize session metadata");
+    std::fs::write(rollout_path, format!("{session_meta}\n{remaining_lines}"))
+        .expect("write legacy rollout");
+}
+
 #[tokio::test]
 async fn resume_agent_from_rollout_uses_edge_data_when_descendant_metadata_source_is_stale() {
-    let harness = AgentControlHarness::new().await;
+    let (home, mut config) = test_config().await;
+    let user_config = toml::from_str("subagent_model_provider_allowlist = [\"ollama\"]")
+        .expect("valid user config");
+    config.config_layer_stack = config
+        .config_layer_stack
+        .with_user_config(&config.codex_home.join(CONFIG_TOML_FILE), user_config)
+        .expect("provider allowlist should be valid user config");
+    let harness = AgentControlHarness::new_with_config(home, config).await;
     let (parent_thread_id, parent_thread) = harness.start_thread().await;
 
     let child_thread_id = harness
@@ -6018,10 +6113,12 @@ async fn resume_agent_from_rollout_uses_edge_data_when_descendant_metadata_sourc
         )
         .await
         .expect("child spawn should succeed");
+    let mut grandchild_config = harness.config.clone();
+    select_test_provider(&mut grandchild_config, "ollama");
     let grandchild_thread_id = harness
         .control
         .spawn_agent(
-            harness.config.clone(),
+            grandchild_config,
             text_input("hello grandchild"),
             Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id: child_thread_id,
@@ -6047,6 +6144,9 @@ async fn resume_agent_from_rollout_uses_edge_data_when_descendant_metadata_sourc
     persist_thread_for_tree_resume(&parent_thread, "parent persisted").await;
     persist_thread_for_tree_resume(&child_thread, "child persisted").await;
     persist_thread_for_tree_resume(&grandchild_thread, "grandchild persisted").await;
+    let grandchild_rollout_path = grandchild_thread
+        .rollout_path()
+        .expect("grandchild rollout should exist");
     wait_for_live_thread_spawn_children(&harness.control, parent_thread_id, &[child_thread_id])
         .await;
     wait_for_live_thread_spawn_children(&harness.control, child_thread_id, &[grandchild_thread_id])
@@ -6080,6 +6180,8 @@ async fn resume_agent_from_rollout_uses_edge_data_when_descendant_metadata_sourc
         .await;
     assert_eq!(report.submit_failed, Vec::<ThreadId>::new());
     assert_eq!(report.timed_out, Vec::<ThreadId>::new());
+
+    clear_rollout_session_parent(&grandchild_rollout_path);
 
     let resumed_parent_thread_id = harness
         .control
@@ -6121,6 +6223,7 @@ async fn resume_agent_from_rollout_uses_edge_data_when_descendant_metadata_sourc
     };
     assert_eq!(resumed_parent_thread_id, child_thread_id);
     assert_eq!(resumed_depth, 2);
+    assert_eq!(resumed_grandchild_snapshot.model_provider_id, "ollama");
 
     let _ = harness
         .control

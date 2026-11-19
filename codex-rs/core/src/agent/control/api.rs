@@ -19,6 +19,7 @@ use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::codex_thread::GuardianRootSnapshot;
 use crate::codex_thread::ThreadConfigSnapshot;
+use crate::config::Config;
 use crate::rollout_budget::RolloutBudgetReminder;
 use codex_protocol::AgentPath;
 use codex_protocol::SessionId;
@@ -26,6 +27,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TokenUsage;
 use codex_rollout_trace::ThreadTraceContext;
@@ -33,6 +35,10 @@ use futures::future::BoxFuture;
 use std::collections::HashSet;
 
 impl AgentControl for LocalAgentControl {
+    fn native_rollout_budget(&self) -> Option<std::sync::Arc<crate::RolloutBudget>> {
+        Some(std::sync::Arc::clone(&self.runtime.rollout_budget))
+    }
+
     fn identity(&self) -> SessionId {
         self.session_id()
     }
@@ -94,6 +100,17 @@ impl AgentControl for LocalAgentControl {
                 }
             };
             Box::pin(self.spawn_agent_internal(config, input, Some(source), options)).await
+        })
+    }
+
+    fn child_uses_openai_provider(
+        &self,
+        agent: ThreadId,
+        parent_config: Config,
+    ) -> BoxFuture<'_, Result<bool>> {
+        Box::pin(async move {
+            self.agent_uses_openai_model_provider(agent, &parent_config)
+                .await
         })
     }
 
@@ -207,7 +224,7 @@ impl AgentControl for LocalAgentControl {
             match version {
                 MultiAgentVersion::Disabled | MultiAgentVersion::V1 => {
                     let snapshot = self.inspect_agent(target).await?;
-                    self.interrupt_agent(target).await?;
+                    self.interrupt_agent(target, Op::Interrupt).await?;
                     Ok(snapshot)
                 }
                 MultiAgentVersion::V2 => self.interrupt_spawned_agent(caller, target).await,
@@ -282,8 +299,12 @@ impl AgentControl for LocalAgentControl {
         self.execution_guard(version, source)
     }
 
-    fn record_usage(&self, usage: TokenUsage) -> BoxFuture<'_, Result<()>> {
-        Box::pin(async move { self.record_rollout_budget_usage(&usage) })
+    fn record_usage(
+        &self,
+        usage: Option<TokenUsage>,
+        hook_charge: codex_hooks::HookCharge,
+    ) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move { self.record_rollout_budget_usage(usage.as_ref(), hook_charge) })
     }
 
     fn turn_finished<'a>(

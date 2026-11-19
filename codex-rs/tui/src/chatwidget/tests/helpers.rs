@@ -109,6 +109,9 @@ pub(crate) fn normalize_agent_center_snapshot(text: impl AsRef<str>) -> String {
                             .replace(&windows_path, unix_path)
                             .replace(&windows_path.replace('\\', "/"), unix_path);
                     }
+                    if normalized.trim() == r"C:\" || normalized.trim() == "C:/" {
+                        normalized = normalized.replace(normalized.trim(), "/");
+                    }
                     // Only ASCII path bytes change, so this is also the removed cell width.
                     let padding = pane.len().saturating_sub(normalized.len());
                     normalized.push_str(&" ".repeat(padding));
@@ -324,6 +327,10 @@ pub(crate) fn set_chatgpt_auth(chat: &mut ChatWidget) {
     chat.model_catalog = test_model_catalog(&chat.config);
 }
 
+pub(crate) fn set_test_model_catalog(chat: &mut ChatWidget, models: Vec<ModelPreset>) {
+    chat.model_catalog = Arc::new(ModelCatalog::new(models));
+}
+
 fn test_model_info(slug: &str, priority: i32, supports_fast_mode: bool) -> ModelInfo {
     let mut service_tiers = Vec::new();
     if supports_fast_mode {
@@ -511,7 +518,7 @@ fn token_usage_breakdown(usage: TokenUsage) -> codex_app_server_protocol::TokenU
         total_tokens: usage.total_tokens,
         input_tokens: usage.input_tokens,
         cached_input_tokens: usage.cached_input_tokens,
-        cache_write_input_tokens: 0,
+        cache_write_input_tokens: usage.cache_write_input_tokens,
         output_tokens: usage.output_tokens,
         reasoning_output_tokens: usage.reasoning_output_tokens,
     }

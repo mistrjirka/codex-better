@@ -155,6 +155,13 @@ pub(crate) async fn prepare(
     .await
     .map_err(ThreadSpawnError::Preparation)?;
     let config = prepared.config;
+    // Daybreak is a first-party Cyber access program. A cross-provider child must
+    // not receive its parent's program override, even when the parent uses Daybreak.
+    let cyber_access_program = config
+        .model_provider
+        .supports_cyber_access_programs(&config.model_provider_id)
+        .then(|| explicit_program_for_spawn(turn))
+        .flatten();
     let task_name = turn
         .session_source
         .get_agent_path()
@@ -198,16 +205,18 @@ pub(crate) async fn prepare(
             config,
             source: spawn_source,
             options: SpawnAgentOptions {
+                request_country: step_context.settings.request_country().clone(),
                 fork_parent_spawn_call_id: fork_mode.as_ref().map(|_| call_id.to_string()),
                 fork_mode,
                 parent_thread_id: Some(session.thread_id),
                 parent_turn_id: Some(turn.sub_id.clone()),
                 root_turn_id: turn.turn_metadata_state.root_turn_id(),
+                inherited_client_metadata: turn.turn_metadata_state.client_metadata_for_child(),
                 turn_trigger: turn.turn_metadata_state.current_turn_trigger(),
                 environments: Some(step_context.inherited_environments.clone()),
                 disabled_plugin_ids: Some(turn.disabled_plugin_ids.clone()),
                 multi_agent_v2_usage_hints,
-                cyber_access_program: explicit_program_for_spawn(turn),
+                cyber_access_program,
                 cyber_access_program_source: SpawnProgramSource::ParentTurn,
             },
         },

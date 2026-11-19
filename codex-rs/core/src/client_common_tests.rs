@@ -4,9 +4,11 @@ use codex_api::TextControls;
 use codex_api::create_text_param_for_request;
 use codex_models_manager::model_info::model_info_from_slug;
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::models::ConfigurationReasoning;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ImageReference;
+use codex_protocol::openai_models::ReasoningEffort;
 use pretty_assertions::assert_eq;
 use serde_json::value::RawValue;
 use std::sync::Arc;
@@ -110,9 +112,91 @@ fn request_copies_project_image_details_for_receiving_model(
 }
 
 #[test]
+fn non_openai_input_normalizer_owns_all_openai_only_cleanup() {
+    let items = vec![
+        ResponseItem::ConfigurationUpdate {
+            reasoning: ConfigurationReasoning {
+                effort: ReasoningEffort::High,
+            },
+        },
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "send_message".to_string(),
+            namespace: Some("collaboration".to_string()),
+            arguments: "{}".to_string(),
+            encrypted_function_args: Some(vec!["ciphertext".to_string()]),
+            call_id: "call-1".to_string(),
+            internal_chat_message_metadata_passthrough: Some(Default::default()),
+            status: None,
+            encrypted_content: None,
+        },
+    ];
+
+    let items = normalize_input_for_non_openai_provider(items)
+        .expect("non-OpenAI request input should normalize");
+
+    assert_eq!(
+        items,
+        vec![ResponseItem::FunctionCall {
+            id: None,
+            name: "send_message".to_string(),
+            namespace: Some("collaboration".to_string()),
+            arguments: "{}".to_string(),
+            encrypted_function_args: None,
+            call_id: "call-1".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+            status: None,
+            encrypted_content: None,
+        }]
+    );
+}
+
+#[test]
+fn plaintext_agent_message_normalizer_rejects_encrypted_content() {
+    let items = vec![
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "send_message".to_string(),
+            namespace: Some("collaboration".to_string()),
+            arguments: "{}".to_string(),
+            encrypted_function_args: Some(vec!["ciphertext".to_string()]),
+            call_id: "call-1".to_string(),
+            internal_chat_message_metadata_passthrough: Some(Default::default()),
+            status: None,
+            encrypted_content: None,
+        },
+        ResponseItem::ConfigurationUpdate {
+            reasoning: ConfigurationReasoning {
+                effort: ReasoningEffort::High,
+            },
+        },
+        ResponseItem::AgentMessage {
+            id: None,
+            author: "/root".to_string(),
+            recipient: "/root/worker".to_string(),
+            content: vec![
+                codex_protocol::models::AgentMessageInputContent::EncryptedContent {
+                    encrypted_content: "ciphertext".to_string(),
+                },
+            ],
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ];
+    let error = normalize_input_for_non_openai_provider(items)
+        .expect_err("encrypted message should fail closed");
+
+    assert!(
+        error
+            .to_string()
+            .contains("cannot consume encrypted inter-agent messages")
+    );
+}
+
+#[test]
 fn serializes_text_verbosity_when_set() {
     let input: Vec<ResponseItem> = vec![];
     let req = ResponsesApiRequest {
+        request_country: Default::default(),
         model: "gpt-5.4".to_string(),
         input,
         tools: Some(empty_tools().into()),
@@ -161,6 +245,7 @@ fn serializes_text_schema_with_strict_format() {
     .expect("text controls");
 
     let req = ResponsesApiRequest {
+        request_country: Default::default(),
         model: "gpt-5.4".to_string(),
         input,
         tools: Some(empty_tools().into()),
@@ -223,6 +308,7 @@ fn serializes_text_schema_with_non_strict_format() {
 fn omits_text_when_not_set() {
     let input: Vec<ResponseItem> = vec![];
     let req = ResponsesApiRequest {
+        request_country: Default::default(),
         model: "gpt-5.4".to_string(),
         input,
         tools: Some(empty_tools().into()),
@@ -248,6 +334,7 @@ fn omits_text_when_not_set() {
 #[test]
 fn serializes_flex_service_tier_when_set() {
     let req = ResponsesApiRequest {
+        request_country: Default::default(),
         model: "gpt-5.4".to_string(),
         input: vec![],
         tools: Some(empty_tools().into()),
@@ -271,4 +358,68 @@ fn serializes_flex_service_tier_when_set() {
         v.get("service_tier").and_then(|tier| tier.as_str()),
         Some("flex")
     );
+}
+
+#[test]
+fn muse_filters_nested_namespace_tools_without_rewriting_survivors() {
+    use codex_tools::JsonSchema;
+    use codex_tools::ResponsesApiNamespace;
+    use codex_tools::ResponsesApiNamespaceTool;
+    use codex_tools::ResponsesApiTool;
+    use std::collections::BTreeMap;
+
+    fn function(name: &str, parameters: JsonSchema) -> ResponsesApiNamespaceTool {
+        ResponsesApiNamespaceTool::Function(ResponsesApiTool {
+            name: name.to_string(),
+            description: String::new(),
+            strict: false,
+            defer_loading: None,
+            parameters,
+            output_schema: None,
+        })
+    }
+
+    let shallow = JsonSchema::object(
+        BTreeMap::from([("text".to_string(), JsonSchema::string(None))]),
+        None,
+        None,
+    );
+    let mut nested = JsonSchema::string(None);
+    for i in 0..7 {
+        nested = JsonSchema::object(
+            BTreeMap::from([(format!("nested_{i}"), nested)]),
+            None,
+            None,
+        );
+    }
+    let referenced = JsonSchema {
+        schema_ref: Some("#/$defs/recursive".into()),
+        ..Default::default()
+    };
+    let tools = vec![ToolSpec::Namespace(ResponsesApiNamespace {
+        name: "test_namespace".into(),
+        description: "Safe subset".into(),
+        tools: vec![
+            function("normal", shallow),
+            function("too_deep", nested),
+            function("referenced", referenced),
+        ],
+    })];
+
+    let filtered = tool_specs_for_muse_spark(&tools);
+    assert_eq!(filtered.len(), 1);
+    let ToolSpec::Namespace(namespace) = &filtered[0] else {
+        panic!("compatible namespace should be preserved");
+    };
+    assert_eq!(namespace.name, "test_namespace");
+    assert_eq!(namespace.tools.len(), 1);
+    let ResponsesApiNamespaceTool::Function(function) = &namespace.tools[0] else {
+        panic!("safe function was unexpectedly replaced");
+    };
+    assert_eq!(function.name, "normal");
+    // Never mutate the original tool catalog used by OpenAI models.
+    let ToolSpec::Namespace(original) = &tools[0] else {
+        panic!("original namespace missing");
+    };
+    assert_eq!(original.tools.len(), 3);
 }

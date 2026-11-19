@@ -1,4 +1,6 @@
 pub use codex_api::ResponseEvent;
+use codex_protocol::ResponseItemId;
+use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
@@ -6,7 +8,9 @@ use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::models::plaintext_agent_message_content;
 use codex_protocol::openai_models::ModelInfo;
+use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ToolSpec;
 use futures::Stream;
 use serde_json::Value;
@@ -71,6 +75,134 @@ impl Prompt {
     }
 }
 
+/// Remove OpenAI-private control fields before a request reaches an external provider.
+pub(crate) fn normalize_input_for_non_openai_provider(
+    input: Vec<ResponseItem>,
+) -> Result<Vec<ResponseItem>> {
+    let mut normalized = Vec::with_capacity(input.len());
+    for item in input {
+        let Some(mut item) = normalize_item_for_non_openai_provider(item)? else {
+            continue;
+        };
+        item.clear_internal_chat_message_metadata_passthrough();
+        if let ResponseItem::FunctionCall {
+            encrypted_function_args,
+            ..
+        } = &mut item
+        {
+            *encrypted_function_args = None;
+        }
+        normalized.push(item);
+    }
+    Ok(normalized)
+}
+
+fn normalize_item_for_non_openai_provider(item: ResponseItem) -> Result<Option<ResponseItem>> {
+    let (id, content) = match item {
+        ResponseItem::AgentMessage { id, content, .. } => (id, content),
+        ResponseItem::ConfigurationUpdate { .. } => return Ok(None),
+        item => return Ok(Some(item)),
+    };
+    let text = plaintext_agent_message_content(&content).ok_or_else(|| {
+        CodexErr::InvalidRequest(
+            "non-OpenAI model providers cannot consume encrypted inter-agent messages".to_string(),
+        )
+    })?;
+    let id = id.map(|id| {
+        let suffix = id.as_str().strip_prefix("amsg_").unwrap_or(id.as_str());
+        ResponseItemId::with_suffix("msg", suffix)
+    });
+    Ok(Some(ResponseItem::Message {
+        id,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText { text }],
+        phase: None,
+        status: None,
+        encrypted_content: None,
+        internal_chat_message_metadata_passthrough: None,
+    }))
+}
+
+/// Meta Muse models reject the entire request when *any* advertised tool has
+/// more than 10 nested JSON-schema levels or unresolved references. Preserve
+/// all other tools, including compatible tools in a partially rejected namespace.
+/// Do not change schemas silently: excluded tools are not advertised at all.
+pub(crate) fn tool_specs_for_muse_spark(tools: &[ToolSpec]) -> Vec<ToolSpec> {
+    let mut excluded = 0usize;
+    let mut kept = Vec::with_capacity(tools.len());
+
+    for spec in tools {
+        match spec {
+            ToolSpec::Function(function) => {
+                if muse_schema_supported(&function.parameters) {
+                    kept.push(spec.clone());
+                } else {
+                    excluded += 1;
+                }
+            }
+            ToolSpec::Namespace(namespace) => {
+                let mut namespace = namespace.clone();
+                namespace.tools.retain(|tool| match tool {
+                    ResponsesApiNamespaceTool::Function(function) => {
+                        let supported = muse_schema_supported(&function.parameters);
+                        if !supported {
+                            excluded += 1;
+                        }
+                        supported
+                    }
+                    ResponsesApiNamespaceTool::Custom(_) => true,
+                });
+                if !namespace.tools.is_empty() {
+                    kept.push(ToolSpec::Namespace(namespace));
+                }
+            }
+            ToolSpec::ToolSearch { parameters, .. } => {
+                if muse_schema_supported(parameters) {
+                    kept.push(spec.clone());
+                } else {
+                    excluded += 1;
+                }
+            }
+            ToolSpec::WebSearch { .. } | ToolSpec::Freeform(_) => kept.push(spec.clone()),
+        }
+    }
+
+    if excluded > 0 {
+        tracing::warn!(
+            excluded_tools = excluded,
+            "Meta Muse tool schemas exceed the provider nesting/reference limits; omitted only the incompatible definitions"
+        );
+    }
+    kept
+}
+
+fn muse_schema_supported<T: serde::Serialize>(schema: &T) -> bool {
+    match serde_json::to_value(schema) {
+        Ok(value) => muse_schema_within_limits(&value, 1),
+        Err(_) => false,
+    }
+}
+
+fn muse_schema_within_limits(schema: &Value, depth: usize) -> bool {
+    // A hard cap is cheaper and safer than a lossy schema rewrite. Keep
+    // argument validation intact for every tool still shown to the model.
+    if depth > 10 {
+        return false;
+    }
+    match schema {
+        Value::Object(map) => {
+            !map.contains_key("$ref")
+                && map
+                    .values()
+                    .all(|value| muse_schema_within_limits(value, depth + 1))
+        }
+        Value::Array(values) => values
+            .iter()
+            .all(|value| muse_schema_within_limits(value, depth + 1)),
+        _ => true,
+    }
+}
+
 fn normalize_image_details(items: &mut [ResponseItem], model_info: &ModelInfo) {
     for item in items {
         match item {
@@ -120,26 +252,119 @@ fn normalize_image_detail(detail: &mut Option<ImageDetail>, model_info: &ModelIn
     }
 }
 
-pub struct ResponseStream {
+/// Whether the producer has posted a response's bill and deferred a turn error.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum ChargePosting {
+    #[default]
+    Unposted,
+    Posted,
+    PostedTurnExhausted,
+}
+
+/// Carries the hook price and the response producer's billing state.
+#[derive(Debug, Default)]
+pub(crate) struct SamplingCharge {
+    pub(crate) hooks: codex_hooks::ModelRequestHookOutcome,
+    pub(crate) posting: ChargePosting,
+}
+
+/// Core consumes a terminal event and its hook output together. Other readers
+/// of the public response stream still see the provider's unmodified event.
+#[derive(Debug)]
+pub(crate) struct SamplingEvent {
+    pub(crate) event: Result<ResponseEvent>,
+    pub(crate) hook_output: SamplingCharge,
+}
+
+/// The provider's usage and the hook's contribution describe the same
+/// response. Keeping them separate preserves the provider's original numbers.
+#[derive(Debug)]
+pub(crate) struct SamplingUsage {
+    pub(crate) provider: Option<codex_protocol::protocol::TokenUsage>,
+    pub(crate) charge: SamplingCharge,
+}
+
+#[cfg(test)]
+impl From<codex_protocol::protocol::TokenUsage> for SamplingUsage {
+    fn from(provider: codex_protocol::protocol::TokenUsage) -> Self {
+        Self {
+            provider: Some(provider),
+            charge: Default::default(),
+        }
+    }
+}
+
+impl From<Result<ResponseEvent>> for SamplingEvent {
+    fn from(event: Result<ResponseEvent>) -> Self {
+        Self {
+            event,
+            hook_output: Default::default(),
+        }
+    }
+}
+
+/// A sampling consumer receives the hook outcome with the provider event it settles.
+pub(crate) struct SamplingStream {
     pub(crate) routing_affinity: Option<codex_http_client::ChatGptRoutingAffinity>,
-    pub(crate) rx_event: mpsc::Receiver<Result<ResponseEvent>>,
+    pub(crate) rx_event: mpsc::Receiver<SamplingEvent>,
     pub(crate) interrupt: Option<oneshot::Sender<codex_api::ResponseInterrupt>>,
     /// Signals the mapper task that the consumer stopped polling before the
     /// provider stream reached its own terminal event.
     pub(crate) consumer_dropped: CancellationToken,
+    /// Once settlement begins, a steer waits for its terminal accounting decision.
+    pub(crate) settlement_started: Arc<std::sync::atomic::AtomicBool>,
 }
 
-impl Stream for ResponseStream {
-    type Item = Result<ResponseEvent>;
+impl SamplingStream {
+    /// A cancelled turn discards any queued event, including an incomplete response's usage.
+    pub(crate) fn accept_for_turn(
+        event: Option<SamplingEvent>,
+        cancellation: &CancellationToken,
+    ) -> Option<SamplingEvent> {
+        if cancellation.is_cancelled() {
+            Some(Err(CodexErr::TurnAborted).into())
+        } else {
+            event
+        }
+    }
+
+    pub(crate) async fn next_for_turn(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Option<SamplingEvent> {
+        let event = tokio::select! {
+            biased;
+            event = self.rx_event.recv() => event,
+            () = cancellation.cancelled() => return Some(Err(CodexErr::TurnAborted).into()),
+        };
+        Self::accept_for_turn(event, cancellation)
+    }
+}
+
+impl Stream for SamplingStream {
+    type Item = SamplingEvent;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.rx_event.poll_recv(cx)
     }
 }
 
-impl Drop for ResponseStream {
+impl Drop for SamplingStream {
     fn drop(&mut self) {
         self.consumer_dropped.cancel();
+    }
+}
+
+/// Response events for low-level client requests that do not run sampling hooks.
+pub struct ResponseStream(pub(crate) SamplingStream);
+
+impl Stream for ResponseStream {
+    type Item = Result<ResponseEvent>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.0)
+            .poll_next(cx)
+            .map(|event| event.map(|event| event.event))
     }
 }
 
